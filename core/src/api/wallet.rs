@@ -6,7 +6,8 @@
 use crate::node::NodeMachine;
 
 pub use crate::types::{
-    ckb_to_shannons, shannons_to_ckb, WalletChannel, WalletInvoice, WalletNodeInfo, WalletPayment,
+    ckb_to_shannons, shannons_to_ckb, WalletChannel, WalletInvoice, WalletNodeInfo,
+    WalletOpenedChannel, WalletPayment, WalletPeer,
 };
 
 fn node() -> Result<&'static NodeMachine, String> {
@@ -21,6 +22,29 @@ pub async fn wallet_node_info() -> Result<WalletNodeInfo, String> {
 /// Channels of the local node. Requires a running node.
 pub async fn wallet_list_channels() -> Result<Vec<WalletChannel>, String> {
     node()?.wallet_list_channels().await
+}
+
+/// Peers currently connected to the local node. Requires a running node.
+pub async fn wallet_list_peers() -> Result<Vec<WalletPeer>, String> {
+    node()?.wallet_list_peers().await
+}
+
+/// Connects to a peer by multiaddr (and remembers it). Requires a running
+/// node; opening a channel needs the peer connected first.
+pub async fn wallet_connect_peer(address: String) -> Result<(), String> {
+    node()?.wallet_connect_peer(address).await
+}
+
+/// Opens a channel to a connected peer. Returns the temporary channel id;
+/// the channel becomes usable once its funding transaction confirms.
+pub async fn wallet_open_channel(
+    peer_pubkey: String,
+    funding_amount_shannons: u64,
+    public_channel: bool,
+) -> Result<WalletOpenedChannel, String> {
+    node()?
+        .wallet_open_channel(peer_pubkey, funding_amount_shannons, public_channel)
+        .await
 }
 
 /// Creates a testnet invoice for `amount_shannons` of native CKB.

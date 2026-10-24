@@ -2,7 +2,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::types::{NodeNetwork, NodePhase, NodeSnapshot};
-use crate::types::{WalletChannel, WalletInvoice, WalletNodeInfo, WalletPayment};
+use crate::types::{
+    WalletChannel, WalletInvoice, WalletNodeInfo, WalletOpenedChannel, WalletPayment, WalletPeer,
+};
 
 const START_DELAY: Duration = Duration::from_millis(300);
 const STOP_DELAY: Duration = Duration::from_millis(180);
@@ -93,6 +95,23 @@ impl NodeMachine {
     }
 
     pub async fn wallet_list_channels(&self) -> Result<Vec<WalletChannel>, String> {
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_list_peers(&self) -> Result<Vec<WalletPeer>, String> {
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_connect_peer(&self, _address: String) -> Result<(), String> {
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_open_channel(
+        &self,
+        _peer_pubkey: String,
+        _funding_amount_shannons: u64,
+        _public_channel: bool,
+    ) -> Result<WalletOpenedChannel, String> {
         Self::wallet_unavailable()
     }
 

@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 pub mod bridge;
+pub mod vault;
 pub mod config;
 pub mod pages;
 pub mod theme;
@@ -28,7 +29,8 @@ fn native(registry: &mut Registry) {
 /// The application's root component.
 #[component]
 pub fn App() -> impl IntoElement {
-    // Headless tests set this: no bridge, no node, just the shell.
+    // Headless tests set this: no bridge, no node, no desktop commands —
+    // just the shell.
     let test_mode = std::env::var("FIBER_WALLET_TEST").is_ok();
     let cx = Cx {
         config: signal(config::get().clone()),
@@ -44,6 +46,10 @@ pub fn App() -> impl IntoElement {
         receive_amount: signal(String::new()),
         receive_description: signal(String::new()),
         pay_invoice: signal(String::new()),
+        channel_peer: signal(String::new()),
+        channel_address: signal(String::new()),
+        channel_amount: signal(String::new()),
+        channel_public: signal(true),
     };
 
     // Persist config edits (theme, accent, proxy) as they happen.

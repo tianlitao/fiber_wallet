@@ -76,6 +76,34 @@ pub struct WalletInvoice {
     pub description: Option<String>,
 }
 
+/// One peer connected to the local node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalletPeer {
+    /// 33-byte compressed identity pubkey, hex.
+    pub pubkey: String,
+    /// The multiaddr this peer is connected on.
+    pub address: String,
+}
+
+/// The temporary channel created by an open-channel request. It appears in
+/// the channel list (with its permanent id) once funding completes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalletOpenedChannel {
+    pub temporary_channel_id: String,
+    pub peer_id: String,
+    /// Shannons, decimal string.
+    pub funding_amount: String,
+}
+
+/// Manifest embedded in a wallet state export (`backup.rs`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WalletBackupManifest {
+    pub format: u32,
+    pub network: String,
+    pub node_id: Option<String>,
+    pub created_at_ms: u64,
+}
+
 /// Format helper: shannons to whole CKB.
 pub fn shannons_to_ckb(shannons: &str) -> String {
     match shannons.parse::<u128>() {

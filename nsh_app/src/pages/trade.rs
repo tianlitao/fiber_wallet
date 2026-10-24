@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use fiber_wallet_core::api::node::NodePhase;
 use fiber_wallet_core::api::wallet::WalletPayment;
 use nsh_core::ui::prelude::*;
 
@@ -15,12 +16,13 @@ const MOCK_RATE: f64 = 0.118_7;
 pub fn trade_page(cx: Cx) -> View {
     view()
         .gap_5()
-        .child(page_header(cx, "交易", "Swap 与发票收付款"))
-        .child(segmented(cx, &["Swap", "收款", "付款"], cx.trade_tab))
+        .child(page_header(cx, "交易", "Swap、发票收付款与通道"))
+        .child(segmented(cx, &["Swap", "收款", "付款", "通道"], cx.trade_tab))
         .child(dynamic(move || match cx.trade_tab.get() {
             0 => Some(view().child(swap_view(cx))),
             1 => Some(view().child(receive_view(cx))),
-            _ => Some(view().child(send_view(cx))),
+            2 => Some(view().child(send_view(cx))),
+            _ => Some(view().child(channels_view(cx))),
         }))
 }
 
@@ -442,6 +444,201 @@ fn receive_view(cx: Cx) -> View {
 }
 
 // ---------------------------------------------------------------- send ----
+// ------------------------------------------------------------- channels ----
+
+/// 通道: connected peers, open-channel form, channel list.
+fn channels_view(cx: Cx) -> View {
+    let ui = WalletBridge::global();
+    let peer_input = cx.channel_peer;
+    let address_input = cx.channel_address;
+    let amount_input = cx.channel_amount;
+    let public = cx.channel_public;
+    let submit_peer = peer_input;
+    let submit_address = address_input;
+    let submit_amount = amount_input;
+    let submit_public = public;
+
+    view()
+        .gap_4()
+        .child(
+            card(cx)
+                .p_6()
+                .gap_4()
+                .max_w(px(620.0))
+                .child(section_label(cx, "开新通道"))
+                .child(labeled_input(
+                    cx,
+                    "对端节点 ID（33 字节 hex pubkey）",
+                    peer_input,
+                    "02…",
+                    false,
+                ))
+                .child(labeled_input(
+                    cx,
+                    "对端地址（可选，未连接时自动 connect）",
+                    address_input,
+                    "/ip4/x.x.x.x/tcp/8228",
+                    false,
+                ))
+                .child(labeled_input(cx, "通道金额 (CKB)", amount_input, "例如 100", false))
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            text("公开通道（可转发路由）")
+                                .text_size(px(ts::SM))
+                                .text_color(move || pal_fn(&cx).fg),
+                        )
+                        .child(toggle(cx, public, |value| {
+                            tracing::info!(public = value, "channel visibility toggled");
+                        })),
+                )
+                .child(primary_button(
+                    cx,
+                    "开通道",
+                    move || !ui.state().open_channel_busy,
+                    move || {
+                        WalletBridge::global().open_channel(
+                            submit_peer.get(),
+                            submit_amount.get(),
+                            submit_public.get(),
+                            Some(submit_address.get()),
+                        )
+                    },
+                ))
+                .child(dynamic(move || {
+                    ui.state().open_channel_busy.then(|| view().child(spinner(cx)))
+                }))
+                .child(dynamic(move || {
+                    ui.state()
+                        .open_channel_error
+                        .clone()
+                        .map(|message| view().child(error_text(cx, message)))
+                })),
+        )
+        .child(
+            card(cx)
+                .p_6()
+                .gap_3()
+                .child(section_label(cx, "已连接节点"))
+                .child(dynamic(move || {
+                    let state = ui.state();
+                    if state.peers.is_empty() {
+                        Some(
+                            view().py_2().child(
+                                text(if state.snapshot.map(|s| s.phase)
+                                    == Some(NodePhase::Running)
+                                {
+                                    "暂无已连接节点。"
+                                } else {
+                                    "节点离线，启动后显示。"
+                                })
+                                .text_size(px(ts::SM))
+                                .text_color(move || pal_fn(&cx).fg_muted),
+                            ),
+                        )
+                    } else {
+                        Some(view().gap_2().children(
+                            state.peers.iter().cloned().map(|peer| {
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .pb_2()
+                                    .child(
+                                        view().flex_1().child(
+                                            text(format!(
+                                                "{}\n{}",
+                                                theme::short_id(&peer.pubkey, 16),
+                                                peer.address
+                                            ))
+                                            .text_size(px(ts::XS))
+                                            .font_family(theme::mono_family)
+                                            .text_color(move || pal_fn(&cx).fg_muted),
+                                        ),
+                                    )
+                                    .child(
+                                        text("选用")
+                                            .text_size(px(ts::XS))
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(px(6.0))
+                                            .bg(move || pal_fn(&cx).card_alt)
+                                            .text_color(move || pal_fn(&cx).fg)
+                                            .cursor_pointer()
+                                            .active(|style| style.opacity(0.6))
+                                            .on_press(move || {
+                                                cx.channel_peer.set(peer.pubkey.clone())
+                                            }),
+                                    )
+                            })
+                        ))
+                    }
+                })),
+        )
+        .child(
+            card(cx)
+                .p_6()
+                .gap_3()
+                .child(section_label(cx, "通道列表"))
+                .child(dynamic(move || {
+                    let state = ui.state();
+                    if state.channels.is_empty() {
+                        Some(
+                            view().py_2().child(
+                                text(if state.snapshot.map(|s| s.phase)
+                                    == Some(NodePhase::Running)
+                                {
+                                    "暂无通道。开通道需要 funding address 有余额。"
+                                } else {
+                                    "节点离线，启动后显示。"
+                                })
+                                .text_size(px(ts::SM))
+                                .text_color(move || pal_fn(&cx).fg_muted),
+                            ),
+                        )
+                    } else {
+                        Some(view().gap_2().children(
+                            state.channels.iter().map(|channel| {
+                                view()
+                                    .gap_1()
+                                    .pb_2()
+                                    .child(
+                                        text(format!(
+                                            "{} CKB local · {} CKB remote · {}",
+                                            shannons_to_ckb(&channel.local_balance),
+                                            shannons_to_ckb(&channel.remote_balance),
+                                            channel.state
+                                        ))
+                                        .text_size(px(ts::SM))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(move || pal_fn(&cx).fg),
+                                    )
+                                    .child(
+                                        text(format!(
+                                            "{} · {} · {}",
+                                            if channel.is_inbound { "inbound" } else { "outbound" },
+                                            channel.channel_id,
+                                            channel.peer_id
+                                        ))
+                                        .text_size(px(ts::XS))
+                                        .font_family(theme::mono_family)
+                                        .text_color(move || pal_fn(&cx).fg_muted),
+                                    )
+                            })
+                        ))
+                    }
+                })),
+        )
+        .child(
+            text("开通道流程：先给 funding address 充测试网 CKB → 对端保持连接 → 提交后等待链上确认，通道变为 Ready 即可收付款。")
+                .text_size(px(ts::XS))
+                .text_color(move || pal_fn(&cx).fg_muted),
+        )
+}
+
 
 fn send_view(cx: Cx) -> View {
     let ui = WalletBridge::global();

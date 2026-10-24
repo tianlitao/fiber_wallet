@@ -18,12 +18,13 @@ use fnn::fiber::graph::NetworkGraph;
 use fnn::fiber::network::{get_chain_hash, init_chain_hash, NetworkActorMessage};
 use fnn::fiber::types::pubkey_from_tentacle;
 use fnn::fiber::types::Hash256;
-use fnn::rpc::channel::{ChannelRpcServerImpl, ListChannelsParams};
+use fnn::rpc::channel::{ChannelRpcServerImpl, ListChannelsParams, OpenChannelParams};
 use fnn::rpc::info::InfoRpcServerImpl;
 use fnn::rpc::invoice::{InvoiceRpcServerImpl, NewInvoiceParams};
 use fnn::rpc::payment::{
     GetPaymentCommandParams, ListPaymentsParams, PaymentRpcServerImpl, SendPaymentCommandParams,
 };
+use fnn::rpc::peer::{ConnectPeerParams, PeerRpcServerImpl};
 use fnn::store::actor::{StoreActor, StoreActorInitializationParameter};
 use fnn::store::open_store_with_migration;
 use fnn::utils::encrypt_decrypt_file::{decrypt_from_file, encrypt_to_file};
@@ -40,7 +41,9 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info};
 
 use crate::types::{NodeNetwork, NodePhase, NodeSnapshot};
-use crate::types::{WalletChannel, WalletInvoice, WalletNodeInfo, WalletPayment};
+use crate::types::{
+    WalletChannel, WalletInvoice, WalletNodeInfo, WalletOpenedChannel, WalletPayment, WalletPeer,
+};
 
 const TESTNET_CONFIG: &str = include_str!("../../assets/fiber-testnet.yml");
 const FIBER_VERSION: &str = "v0.9.1";
@@ -606,6 +609,80 @@ impl NodeMachine {
                 remote_balance: channel.remote_balance.to_string(),
             })
             .collect())
+    }
+
+    /// Connected peers. Opening a channel requires the peer to be connected
+    /// first (`wallet_connect_peer`), so the UI offers this list to pick from.
+    pub async fn wallet_list_peers(&self) -> Result<Vec<WalletPeer>, String> {
+        let (network_actor, _store, _fiber_config, _ckb_config) = self.running_parts()?;
+        let result = PeerRpcServerImpl::new(network_actor)
+            .list_peers()
+            .await
+            .map_err(|err| err.message().to_owned())?;
+        Ok(result
+            .peers
+            .into_iter()
+            .map(|peer| WalletPeer {
+                pubkey: hex::encode(peer.pubkey.0),
+                address: peer.address,
+            })
+            .collect())
+    }
+
+    /// Connects to a peer by multiaddr and remembers it in the peer store.
+    pub async fn wallet_connect_peer(&self, address: String) -> Result<(), String> {
+        let (network_actor, _store, _fiber_config, _ckb_config) = self.running_parts()?;
+        PeerRpcServerImpl::new(network_actor)
+            .connect_peer(ConnectPeerParams {
+                address: Some(address),
+                pubkey: None,
+                save: Some(true),
+                addr_type: None,
+            })
+            .await
+            .map_err(|err| err.message().to_owned())
+    }
+
+    /// Opens a channel to a connected peer. Returns the temporary channel id;
+    /// the channel is usable once its funding transaction confirms (watch it
+    /// appear in `wallet_list_channels` with state `Ready`).
+    pub async fn wallet_open_channel(
+        &self,
+        peer_pubkey: String,
+        funding_amount_shannons: u64,
+        public_channel: bool,
+    ) -> Result<WalletOpenedChannel, String> {
+        let (network_actor, store, _fiber_config, _ckb_config) = self.running_parts()?;
+        let bytes = hex::decode(peer_pubkey.trim())
+            .map_err(|err| format!("对端节点 ID 不是合法 hex: {err}"))?;
+        let pubkey = fiber_json_types::Pubkey::from_slice(&bytes)
+            .map_err(|err| format!("对端节点 ID: {err}"))?;
+
+        let result = ChannelRpcServerImpl::new(network_actor, store)
+            .open_channel(OpenChannelParams {
+                pubkey,
+                funding_amount: u128::from(funding_amount_shannons),
+                public: Some(public_channel),
+                one_way: None,
+                funding_udt_type_script: None,
+                shutdown_script: None,
+                commitment_delay_epoch: None,
+                commitment_fee_rate: None,
+                funding_fee_rate: None,
+                tlc_expiry_delta: None,
+                tlc_min_value: None,
+                tlc_fee_proportional_millionths: None,
+                max_tlc_value_in_flight: None,
+                max_tlc_number_in_flight: None,
+            })
+            .await
+            .map_err(|err| err.message().to_owned())?;
+
+        Ok(WalletOpenedChannel {
+            temporary_channel_id: hex::encode(result.temporary_channel_id.0),
+            peer_id: peer_pubkey.trim().to_ascii_lowercase(),
+            funding_amount: funding_amount_shannons.to_string(),
+        })
     }
 
     pub async fn wallet_new_invoice(

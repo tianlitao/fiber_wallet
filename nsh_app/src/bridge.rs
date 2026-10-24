@@ -12,8 +12,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use fiber_wallet_core::api::node::{self, NodeNetwork, NodePhase, NodeSnapshot};
+use crate::vault;
 use fiber_wallet_core::api::wallet::{
-    self, WalletChannel, WalletInvoice, WalletNodeInfo, WalletPayment,
+    self, WalletChannel, WalletInvoice, WalletNodeInfo, WalletOpenedChannel, WalletPayment,
+    WalletPeer,
 };
 
 /// Everything the wallet page renders, cloned from the bridge on each tick.
@@ -25,6 +27,7 @@ pub struct UiState {
     pub node_info: Option<WalletNodeInfo>,
     pub channels: Vec<WalletChannel>,
     pub payments: Vec<WalletPayment>,
+    pub peers: Vec<WalletPeer>,
     pub last_invoice: Option<WalletInvoice>,
     pub invoice_busy: bool,
     pub invoice_error: Option<String>,
@@ -33,13 +36,22 @@ pub struct UiState {
     pub send_error: Option<String>,
     pub data_busy: bool,
     pub data_error: Option<String>,
+    pub open_channel_busy: bool,
+    pub open_channel_error: Option<String>,
+    pub backup_busy: bool,
+    pub backup_message: Option<String>,
+    pub backup_error: Option<String>,
+    pub password_busy: bool,
+    pub password_message: Option<String>,
+    pub password_error: Option<String>,
 }
 
 pub struct WalletBridge {
     state: Mutex<UiState>,
     runtime: tokio::runtime::Runtime,
     data_dir: PathBuf,
-    secret_password: String,
+    secret_password: Mutex<String>,
+    pub vault_kind: vault::VaultKind,
     lifecycle_busy: AtomicBool,
     refresh_busy: AtomicBool,
 }
@@ -61,7 +73,8 @@ impl WalletBridge {
         if let Err(error) = std::fs::create_dir_all(&data_dir) {
             eprintln!("failed to create data directory: {error}");
         }
-        let secret_password = load_or_create_password(&data_dir);
+        let (secret_password, vault_kind) = vault::load_or_create(&data_dir);
+        tracing::info!(vault = ?vault_kind, "keystore password loaded");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -71,7 +84,8 @@ impl WalletBridge {
             state: Mutex::new(UiState::default()),
             runtime,
             data_dir,
-            secret_password,
+            secret_password: Mutex::new(secret_password),
+            vault_kind,
             lifecycle_busy: AtomicBool::new(false),
             refresh_busy: AtomicBool::new(false),
         }
@@ -110,10 +124,11 @@ impl WalletBridge {
         self.update(|state| state.busy = true);
         self.guarded("initialize", move || {
             tracing::info!(data_dir = %self.data_dir.display(), "initializing local node");
+            let password = self.secret_password.lock().expect("password poisoned").clone();
             let snapshot = node::init_local_node(
                 NodeNetwork::Testnet,
                 self.data_dir.to_string_lossy().into_owned(),
-                self.secret_password.clone(),
+                password,
             );
             self.set_snapshot(snapshot);
             self.start_inner();
@@ -254,23 +269,32 @@ impl WalletBridge {
         }
         self.update(|state| state.data_busy = true);
         self.guarded("refresh", move || {
-            let (info, channels, payments) = self.runtime.block_on(async {
+            let (info, channels, payments, peers) = self.runtime.block_on(async {
                 tokio::join!(
                     wallet::wallet_node_info(),
                     wallet::wallet_list_channels(),
                     wallet::wallet_list_payments(50),
+                    wallet::wallet_list_peers(),
                 )
             });
             self.update(|state| {
-                match (info, channels, payments) {
-                    (Ok(info), Ok(channels), Ok(payments)) => {
+                match (info, channels, payments, peers) {
+                    (Ok(info), Ok(channels), Ok(payments), Ok(peers)) => {
                         state.node_info = Some(info);
                         state.channels = channels;
                         state.payments = payments;
+                        state.peers = peers;
                         state.data_error = None;
                     }
-                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                        state.data_error = Some(error);
+                    (info, channels, payments, peers) => {
+                        let error = info
+                            .err()
+                            .or(channels.err())
+                            .or(payments.err())
+                            .or(peers.err());
+                        if let Some(error) = error {
+                            state.data_error = Some(error);
+                        }
                     }
                 }
                 state.data_busy = false;
@@ -362,6 +386,173 @@ impl WalletBridge {
             }
         });
     }
+
+    /// Refuses an operation that needs the node stopped, with a UI-facing
+    /// message.
+    fn require_stopped(&self, action: &str) -> Result<(), String> {
+        match self.state().snapshot {
+            None => Ok(()),
+            Some(snapshot) => match snapshot.phase {
+                NodePhase::Stopped | NodePhase::Failed => Ok(()),
+                other => Err(format!(
+                    "请先停止节点再{action}（当前状态：{}）",
+                    phase_name(other)
+                )),
+            },
+        }
+    }
+
+    /// Connects (optionally) and opens a channel to a peer, then refreshes.
+    /// `peer` is the 33-byte hex pubkey; pass `connect_address` when the peer
+    /// is not connected yet.
+    pub fn open_channel(
+        &'static self,
+        peer: String,
+        funding_amount_ckb: String,
+        public_channel: bool,
+        connect_address: Option<String>,
+    ) {
+        self.update(|state| {
+            state.open_channel_busy = true;
+            state.open_channel_error = None;
+        });
+        self.guarded("open_channel", move || {
+            let result = (|| -> Result<WalletOpenedChannel, String> {
+                if let Some(address) = connect_address.filter(|a| !a.trim().is_empty()) {
+                    self.runtime
+                        .block_on(wallet::wallet_connect_peer(address.trim().to_owned()))?;
+                }
+                let shannons = wallet::ckb_to_shannons(funding_amount_ckb.trim().to_owned())?;
+                let shannons: u64 = shannons
+                    .parse()
+                    .map_err(|error| format!("CKB 金额超出范围: {error}"))?;
+                self.runtime.block_on(wallet::wallet_open_channel(
+                    peer.trim().to_owned(),
+                    shannons,
+                    public_channel,
+                ))
+            })();
+            self.update(|state| {
+                state.open_channel_busy = false;
+                match result {
+                    Ok(_) => {}
+                    Err(error) => state.open_channel_error = Some(error),
+                }
+            });
+            if self.state().open_channel_error.is_none() {
+                self.refresh();
+            }
+        });
+    }
+
+    /// Re-encrypts the keystore files under a new password and updates the
+    /// vault. Requires the node to be stopped.
+    pub fn change_password(&'static self, new_password: String) {
+        self.update(|state| {
+            state.password_busy = true;
+            state.password_error = None;
+            state.password_message = None;
+        });
+        self.guarded("change_password", move || {
+            let outcome = (|| {
+                self.require_stopped("轮换密钥加密密码")?;
+                let old = self
+                    .secret_password
+                    .lock()
+                    .expect("password poisoned")
+                    .clone();
+                fiber_wallet_core::keystore::change_keystore_password(
+                    &self.data_dir,
+                    &old,
+                    new_password.trim(),
+                )?;
+                vault::store(new_password.trim())
+                    .map_err(|error| format!("新密码写入钥匙串失败: {error}"))?;
+                *self.secret_password.lock().expect("password poisoned") =
+                    new_password.trim().to_owned();
+                Ok(())
+            })();
+            self.update(|state| {
+                state.password_busy = false;
+                match outcome {
+                    Ok(()) => state.password_message = Some("密钥加密密码已轮换".to_owned()),
+                    Err(error) => state.password_error = Some(error),
+                }
+            });
+        });
+    }
+
+    /// Exports the wallet state (keystore + channel store) encrypted with
+    /// `password`. Requires the node to be stopped.
+    pub fn export_state(&'static self, out_path: String, password: String) {
+        self.update(|state| {
+            state.backup_busy = true;
+            state.backup_error = None;
+            state.backup_message = None;
+        });
+        self.guarded("export_state", move || {
+            let outcome = (|| {
+                self.require_stopped("导出钱包状态")?;
+                let node_id = self.state().snapshot.and_then(|snapshot| snapshot.node_id);
+                fiber_wallet_core::backup::export_wallet_state(
+                    &self.data_dir,
+                    Path::new(out_path.trim()),
+                    &password,
+                    node_id.as_deref(),
+                )
+            })();
+            self.update(|state| {
+                state.backup_busy = false;
+                match outcome {
+                    Ok(manifest) => {
+                        state.backup_message = Some(format!(
+                            "已导出（{}）到 {}",
+                            manifest.node_id.as_deref().unwrap_or("未初始化节点"),
+                            out_path.trim()
+                        ));
+                    }
+                    Err(error) => state.backup_error = Some(error),
+                }
+            });
+        });
+    }
+
+    /// Imports a wallet state archive, replacing the current one; restarts
+    /// the node afterwards. Requires the node to be stopped.
+    pub fn import_state(&'static self, archive_path: String, password: String) {
+        self.update(|state| {
+            state.backup_busy = true;
+            state.backup_error = None;
+            state.backup_message = None;
+        });
+        self.guarded("import_state", move || {
+            let outcome = (|| {
+                self.require_stopped("导入钱包状态")?;
+                fiber_wallet_core::backup::import_wallet_state(
+                    &self.data_dir,
+                    Path::new(archive_path.trim()),
+                    &password,
+                )
+            })();
+            self.update(|state| {
+                state.backup_busy = false;
+                match &outcome {
+                    Ok(_) => {
+                        state.backup_message =
+                            Some("导入完成，已备份原状态，节点重启中…".to_owned());
+                        state.node_info = None;
+                        state.channels.clear();
+                        state.payments.clear();
+                        state.peers.clear();
+                    }
+                    Err(error) => state.backup_error = Some(error.clone()),
+                }
+            });
+            if outcome.is_ok() {
+                self.restart();
+            }
+        });
+    }
 }
 
 /// This shell's wallet data directory, distinct from other hosts' so
@@ -375,47 +566,6 @@ fn wallet_data_directory() -> PathBuf {
 /// The data directory for display in settings.
 pub fn data_directory() -> String {
     wallet_data_directory().to_string_lossy().into_owned()
-}
-
-/// Development stand-in for the M2 Keychain integration: `FIBER_SECRET_KEY_PASSWORD`
-/// wins, else a random hex password persisted 0600 next to the data directory.
-fn load_or_create_password(data_dir: &Path) -> String {
-    if let Some(password) = std::env::var("FIBER_SECRET_KEY_PASSWORD")
-        .ok()
-        .map(|password| password.trim().to_owned())
-        .filter(|password| !password.is_empty())
-    {
-        return password;
-    }
-    let path = data_dir.join(".key-password");
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
-    }
-    let password: String = (0..32)
-        .map(|_| format!("{:02x}", rand::random::<u8>()))
-        .collect();
-    use std::io::Write as _;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            let _ = file.write_all(password.as_bytes());
-        }
-    }
-    #[cfg(not(unix))]
-    if let Ok(mut file) = std::fs::File::create(&path) {
-        let _ = file.write_all(password.as_bytes());
-    }
-    password
 }
 
 /// Lowercase phase name for the event log.

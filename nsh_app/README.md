@@ -30,6 +30,26 @@ accents) resolved from the config signal plus the system appearance; every
 style closure re-reads it, so switches apply live. Type scale is
 Longbridge-like (11/12/13/14/16/18/20/28).
 
+## Channels, keystore, backup
+
+- **开通道** (交易 → 通道): lists connected peers (`wallet_list_peers`), opens
+  channels by peer pubkey + CKB amount (`wallet_open_channel`, public/private),
+  auto-connects by multiaddr when given. Needs a funded funding address
+  (testnet faucet) and the peer connected first.
+- **Keystore password**: lives in the macOS Keychain (`dev.fiberwallet.nsh`
+  / `ckb-key-password` via the `keyring` crate). A legacy `.key-password`
+  file is adopted into the Keychain on first run; `FIBER_SECRET_KEY_PASSWORD`
+  still overrides. 设置 → 安全 rotates the password: generates a new random
+  one and re-encrypts `key`/`sk` in place (`fiber_wallet_core::keystore`),
+  node must be stopped.
+- **导出 / 导入** (设置 → 导出 / 导入): the whole wallet state (keystore +
+  SQLite channel store + manifest) as a gzip-tar encrypted with FNN's
+  scrypt+AES format (`fiber_wallet_core::backup`), `.fwexport` suffix.
+  Import validates the manifest, backs the current state up to
+  `import-backup-<ts>/` and restarts the node. MOVE semantics only: the
+  exporting instance must be permanently stopped — one channel state must
+  never run under two instances of the same node identity.
+
 ## Extras
 
 - **QR codes**: the funding address (首页 hero) and every created invoice
@@ -37,7 +57,30 @@ Longbridge-like (11/12/13/14/16/18/20/28).
   re-recorded on theme changes.
 - **Title bar**: the system title bar is hidden; the app draws its own
   draggable bar (`window_drag`), leaving macOS traffic lights their space.
-- **Toasts** on proxy save, node restart, and simulated swap completion.
+- **Toasts** on proxy save, node restart, dApp cards, and simulated swap
+  completion.
+- **Swap**: simulated mid-market rate with live jitter and 0.3% route fee
+  display until a real Fiber router lands in M3+; amount validation, flip
+  direction.
+- **Session invoice history**: 收款 keeps the invoices created this session
+  (node restarts drop the last one, the list keeps them).
+- **Settings → 节点**: open the data directory in Finder.
+- **Panic guard**: every bridge operation runs on a thread that turns a
+  wallet-core panic into a Failed snapshot + error log instead of a silently
+  dead operation.
+
+## Tests
+
+```sh
+cargo test --test app                        # headless: probe mounts (fast)
+cargo test --test app -- --include-ignored   # full shell mount test
+```
+
+Known upstream issue: nsh-testing 0.2.0's headless driver intermittently
+never finishes the engine's first commit — even a one-`text` root hangs
+`Headless::start` on some runs and passes on the next (the windowed app is
+unaffected). The full-shell test is marked `#[ignore]` with details in
+`tests/app.rs`.
 
 ## Config & proxy
 

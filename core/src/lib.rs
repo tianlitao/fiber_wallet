@@ -5,6 +5,8 @@
 //! operations directly. UI bindings belong to the host, not to this crate.
 
 pub mod api;
+pub mod backup;
+pub mod keystore;
 pub mod node;
 pub mod recovery_smoke;
 pub mod types;

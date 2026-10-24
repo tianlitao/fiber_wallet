@@ -2,6 +2,8 @@
 
 use nsh_core::ui::prelude::*;
 
+use fiber_wallet_core::api::node::NodePhase;
+
 use crate::bridge::WalletBridge;
 use crate::config::{self, Accent, AppConfig, ThemeMode};
 use crate::theme::type_scale as ts;
@@ -11,9 +13,11 @@ pub fn settings_page(cx: Cx) -> View {
     view()
         .gap_5()
         .max_w(px(720.0))
-        .child(page_header(cx, "设置", "外观、网络与节点"))
+        .child(page_header(cx, "设置", "外观、网络、安全与备份"))
         .child(appearance_card(cx))
         .child(proxy_card(cx))
+        .child(security_card(cx))
+        .child(backup_card(cx))
         .child(node_card(cx))
         .child(about_card(cx))
 }
@@ -205,6 +209,250 @@ fn proxy_card(cx: Cx) -> View {
                     .text_color(move || pal_fn(&cx).fg_muted),
             ),
     )
+}
+
+/// 安全: keystore password vault kind + rotation (node must be stopped).
+fn security_card(cx: Cx) -> View {
+    let ui = WalletBridge::global();
+    let vault_label = ui.vault_kind.label();
+    let env_override = ui.vault_kind == crate::vault::VaultKind::Env;
+
+    view().child(
+        settings_group(cx, "安全")
+            .child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        view()
+                            .gap_1()
+                            .child(
+                                text("密钥加密密码存储")
+                                    .text_size(px(ts::SM))
+                                    .text_color(move || pal_fn(&cx).fg),
+                            )
+                            .child(
+                                text("加密数据目录中的 CKB 私钥与节点身份密钥")
+                                    .text_size(px(ts::XS))
+                                    .text_color(move || pal_fn(&cx).fg_muted),
+                            ),
+                    )
+                    .child(
+                        text(vault_label)
+                            .text_size(px(ts::SM))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(move || pal_fn(&cx).accent),
+                    ),
+            )
+            .child(divider(cx))
+            .child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        view()
+                            .gap_1()
+                            .child(
+                                text("轮换密钥加密密码")
+                                    .text_size(px(ts::SM))
+                                    .text_color(move || pal_fn(&cx).fg),
+                            )
+                            .child(
+                                text("生成新随机密码并重加密密钥文件；需先停止节点")
+                                    .text_size(px(ts::XS))
+                                    .text_color(move || pal_fn(&cx).fg_muted),
+                            ),
+                    )
+                    .child(outline_button(
+                        cx,
+                        "轮换",
+                        move || !ui.state().password_busy && !env_override,
+                        move || {
+                            let new_password: String = (0..32)
+                                .map(|_| format!("{:02x}", rand::random::<u8>()))
+                                .collect();
+                            WalletBridge::global().change_password(new_password);
+                        },
+                    )),
+            )
+            .when(env_override, |card| {
+                card.child(
+                    text("当前密码来自 FIBER_SECRET_KEY_PASSWORD 环境变量：轮换会被下次启动覆盖，请直接修改环境变量。")
+                        .text_size(px(ts::XS))
+                        .text_color(move || pal_fn(&cx).warn),
+                )
+            })
+            .child(dynamic(move || {
+                ui.state().password_busy.then(|| view().child(spinner(cx)))
+            }))
+            .child(dynamic(move || {
+                let state = ui.state();
+                state
+                    .password_message
+                    .clone()
+                    .map(|message| view().child(ok_text(cx, message)))
+                    .or_else(|| {
+                        state
+                            .password_error
+                            .clone()
+                            .map(|message| view().child(error_text(cx, message)))
+                    })
+            })),
+    )
+}
+
+/// 导出 / 导入: whole wallet state (keystore + channel store) as a
+/// password-encrypted archive. Node must be stopped for both.
+fn backup_card(cx: Cx) -> View {
+    let ui = WalletBridge::global();
+    let export_path = signal(default_export_path());
+    let export_password = signal(String::new());
+    let export_confirm = signal(String::new());
+    let import_path = signal(String::new());
+    let import_password = signal(String::new());
+    let export_path_submit = export_path;
+    let export_password_submit = export_password;
+    let export_confirm_submit = export_confirm;
+    let import_path_submit = import_path;
+    let import_password_submit = import_password;
+
+    view().child(
+        settings_group(cx, "导出 / 导入")
+            .child(
+                text("导出 = 数据目录（密钥 + 通道状态）打包并用密码加密；导入 = 替换当前数据并自动重启节点。两种操作都要求节点已停止。")
+                    .text_size(px(ts::XS))
+                    .text_color(move || pal_fn(&cx).fg_muted),
+            )
+            .child(
+                view()
+                    .flex_row()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        labeled_input(cx, "导出到", export_path, "~/Downloads/…", false).flex_1(),
+                    )
+                    .child(labeled_input(cx, "导出密码 (≥8位)", export_password, "••••••••", false).w(px(170.0)))
+                    .child(labeled_input(cx, "确认密码", export_confirm, "••••••••", false).w(px(170.0))),
+            )
+            .child(
+                view()
+                    .flex_row()
+                    .gap_3()
+                    .child(
+                        primary_button(
+                            cx,
+                            "导出钱包状态",
+                            move || {
+                                let state = ui.state();
+                                !state.backup_busy
+                                    && state.snapshot.as_ref().map(|s| s.phase)
+                                        != Some(NodePhase::Running)
+                            },
+                            move || {
+                                let password = export_password_submit.get();
+                                if password.chars().count() < 8
+                                    || password != export_confirm_submit.get()
+                                {
+                                    toast("导出密码需 ≥8 位且两次输入一致", ToastDuration::Short);
+                                    return;
+                                }
+                                WalletBridge::global().export_state(
+                                    export_path_submit.get(),
+                                    password,
+                                );
+                            },
+                        ),
+                    )
+                    .child(
+                        outline_button(cx, "在 Finder 中显示导出目录", || true, move || {
+                            let downloads = std::env::var("HOME")
+                                .map(|home| format!("{home}/Downloads"))
+                                .unwrap_or_else(|_| ".".to_owned());
+                            #[cfg(target_os = "macos")]
+                            {
+                                let _ = std::process::Command::new("open").arg(&downloads).spawn();
+                            }
+                            let _ = downloads;
+                        }),
+                    ),
+            )
+            .child(divider(cx))
+            .child(
+                view()
+                    .flex_row()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        labeled_input(cx, "导入文件 (.fwexport)", import_path, "选择或粘贴路径", false)
+                            .flex_1(),
+                    )
+                    .child(
+                        labeled_input(cx, "导入密码", import_password, "••••••••", false)
+                            .w(px(170.0)),
+                    ),
+            )
+            .child(
+                text("导入会覆盖当前钱包状态，并把原状态备份到数据目录 import-backup-<时间>/。导入前请确认导出方实例已永久停止——同一通道状态在两处运行会触发对端撤销惩罚。")
+                    .text_size(px(ts::XS))
+                    .text_color(move || pal_fn(&cx).warn),
+            )
+            .child(
+                outline_button(
+                    cx,
+                    "导入钱包状态",
+                    move || {
+                        let state = ui.state();
+                        !state.backup_busy
+                            && state.snapshot.as_ref().map(|s| s.phase) != Some(NodePhase::Running)
+                    },
+                    move || {
+                        let path = import_path_submit.get();
+                        if path.trim().is_empty() {
+                            toast("请先填写导入文件路径", ToastDuration::Short);
+                            return;
+                        }
+                        WalletBridge::global().import_state(path, import_password_submit.get());
+                    },
+                ),
+            )
+            .child(dynamic(move || {
+                ui.state().backup_busy.then(|| view().child(spinner(cx)))
+            }))
+            .child(dynamic(move || {
+                let state = ui.state();
+                state
+                    .backup_message
+                    .clone()
+                    .map(|message| view().child(ok_text(cx, message)))
+                    .or_else(|| {
+                        state
+                            .backup_error
+                            .clone()
+                            .map(|message| view().child(error_text(cx, message)))
+                    })
+            })),
+    )
+}
+
+fn ok_text(cx: Cx, message: String) -> View {
+    view().child(
+        text(message)
+            .text_size(px(ts::SM))
+            .text_color(move || pal_fn(&cx).ok),
+    )
+}
+
+fn default_export_path() -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    match std::env::var("HOME") {
+        Ok(home) => format!("{home}/Downloads/fiber-wallet-export-{stamp}.fwexport"),
+        Err(_) => format!("fiber-wallet-export-{stamp}.fwexport"),
+    }
 }
 
 fn node_card(cx: Cx) -> View {

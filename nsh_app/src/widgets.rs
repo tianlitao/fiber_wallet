@@ -21,6 +21,10 @@ pub struct Cx {
     pub receive_amount: Signal<String>,
     pub receive_description: Signal<String>,
     pub pay_invoice: Signal<String>,
+    pub channel_peer: Signal<String>,
+    pub channel_address: Signal<String>,
+    pub channel_amount: Signal<String>,
+    pub channel_public: Signal<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
