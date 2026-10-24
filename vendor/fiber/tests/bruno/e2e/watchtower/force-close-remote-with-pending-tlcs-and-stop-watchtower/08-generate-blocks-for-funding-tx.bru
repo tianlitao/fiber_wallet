@@ -1,0 +1,42 @@
+meta {
+  name: generate a few blocks
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{CKB_RPC_URL}}
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  Accept: application/json
+}
+
+body:json {
+  {
+    "id": 42,
+    "jsonrpc": "2.0",
+    "method": "generate_epochs",
+    "params": ["0x1"]
+  }
+}
+
+assert {
+  res.status: eq 200
+}
+
+script:pre-request {
+  await new Promise(r => setTimeout(r, 5000));
+}
+
+script:post-response {
+  const { waitChannelReady } = require(process.cwd() + "/scripts/wait-channel-ready");
+
+  await waitChannelReady({
+    bru,
+    rpcUrls: ["NODE1_RPC_URL", "NODE2_RPC_URL"],
+  });
+}

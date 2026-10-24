@@ -1,0 +1,42 @@
+[package]
+name = "fiber-bin"
+version = "0.9.1"
+edition = "2021"
+
+[[bin]]
+name = "fnn"
+path = "src/main.rs"
+
+[features]
+default = ["fnn/rocksdb"]
+debug-add-tlc = ["fnn/debug-add-tlc"]
+metrics = ["fnn/metrics"]
+sqlite = ["fnn/sqlite"]
+
+[dependencies]
+fnn = { path = "../fiber-lib" }
+ckb-chain-spec = "1"
+ckb-resource = "1"
+ractor = { version = "0.15", features = [
+  "async-trait",
+] }
+jsonrpsee = { version = "0.25", features = ["http-client"] }
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "net",
+    "time",
+    "signal",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["fs"] }
+
+[dev-dependencies]
+fiber-store = { path = "../fiber-store", features = ["rocksdb"] }
+tempfile = "3.10.1"

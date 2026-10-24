@@ -1,0 +1,139 @@
+use crate::fiber::network::{PeerConnectSource, PeerDisconnectReason};
+use crate::fiber::{NetworkActorCommand, NetworkActorMessage};
+use crate::log_and_error;
+use crate::rpc::utils::{rpc_error, RpcResultExt};
+use fiber_types::{Multiaddr, Pubkey};
+#[cfg(not(target_arch = "wasm32"))]
+use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::types::ErrorObjectOwned;
+use std::convert::TryFrom;
+use tentacle::utils::TransportType;
+
+use ractor::call;
+use ractor::ActorRef;
+
+pub use fiber_json_types::{ConnectPeerParams, DisconnectPeerParams, ListPeersResult, PeerInfo};
+
+/// Convert a JSON-RPC transport type to the internal tentacle transport type.
+fn to_transport_type(t: fiber_json_types::TransportType) -> TransportType {
+    match t {
+        fiber_json_types::TransportType::Tcp => TransportType::Tcp,
+        fiber_json_types::TransportType::Ws => TransportType::Ws,
+        fiber_json_types::TransportType::Wss => TransportType::Wss,
+    }
+}
+
+/// RPC module for peer management.
+#[cfg(not(target_arch = "wasm32"))]
+#[rpc(server)]
+trait PeerRpc {
+    /// Connect to a peer.
+    #[method(name = "connect_peer")]
+    async fn connect_peer(&self, params: ConnectPeerParams) -> Result<(), ErrorObjectOwned>;
+
+    /// Disconnect from a peer.
+    #[method(name = "disconnect_peer")]
+    async fn disconnect_peer(&self, params: DisconnectPeerParams) -> Result<(), ErrorObjectOwned>;
+
+    /// List connected peers
+    #[method(name = "list_peers")]
+    async fn list_peers(&self) -> Result<ListPeersResult, ErrorObjectOwned>;
+}
+
+pub struct PeerRpcServerImpl {
+    actor: ActorRef<NetworkActorMessage>,
+}
+
+impl PeerRpcServerImpl {
+    pub fn new(actor: ActorRef<NetworkActorMessage>) -> Self {
+        PeerRpcServerImpl { actor }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait::async_trait]
+impl PeerRpcServer for PeerRpcServerImpl {
+    /// Connect to a peer.
+    async fn connect_peer(&self, params: ConnectPeerParams) -> Result<(), ErrorObjectOwned> {
+        self.connect_peer(params).await
+    }
+
+    /// Disconnect from a peer.
+    async fn disconnect_peer(&self, params: DisconnectPeerParams) -> Result<(), ErrorObjectOwned> {
+        self.disconnect_peer(params).await
+    }
+
+    /// List connected peers
+    async fn list_peers(&self) -> Result<ListPeersResult, ErrorObjectOwned> {
+        self.list_peers().await
+    }
+}
+
+impl PeerRpcServerImpl {
+    pub async fn connect_peer(&self, params: ConnectPeerParams) -> Result<(), ErrorObjectOwned> {
+        if let Some(address_str) = params.address.as_ref() {
+            // FIXME: it's better to fix this in Multiaddr
+            if address_str.is_empty() {
+                return Err(rpc_error(
+                    "address must not be empty, expected a multiaddr like /ip4/1.2.3.4/tcp/8080",
+                ));
+            }
+            let address = address_str.parse::<Multiaddr>().rpc_err()?;
+            let save = params.save.unwrap_or(true);
+            let message = |rpc_reply| {
+                NetworkActorMessage::Command(NetworkActorCommand::ConnectPeer(
+                    address,
+                    save,
+                    PeerConnectSource::Manual,
+                    Some(rpc_reply),
+                ))
+            };
+            return crate::handle_actor_call!(self.actor, message, params);
+        }
+
+        if let Some(pubkey_str) = params.pubkey {
+            let pubkey = Pubkey::try_from(pubkey_str).rpc_err()?;
+            let addr_transport = params.addr_type.map(to_transport_type);
+            let message = |rpc_reply| {
+                NetworkActorMessage::Command(NetworkActorCommand::ConnectPeerWithPubkey(
+                    pubkey,
+                    addr_transport,
+                    PeerConnectSource::Manual,
+                    rpc_reply,
+                ))
+            };
+            return crate::handle_actor_call!(self.actor, message, params);
+        }
+
+        Err(rpc_error("either `address` or `pubkey` is required"))
+    }
+
+    pub async fn disconnect_peer(
+        &self,
+        params: DisconnectPeerParams,
+    ) -> Result<(), ErrorObjectOwned> {
+        let pubkey = Pubkey::try_from(params.pubkey).rpc_err()?;
+        let message = |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::DisconnectPeer(
+                pubkey,
+                PeerDisconnectReason::Requested,
+                Some(rpc_reply),
+            ))
+        };
+        crate::handle_actor_call!(self.actor, message, params)
+    }
+
+    pub async fn list_peers(&self) -> Result<ListPeersResult, ErrorObjectOwned> {
+        let message =
+            |rpc_reply| NetworkActorMessage::Command(NetworkActorCommand::ListPeers((), rpc_reply));
+
+        crate::handle_actor_call!(self.actor, message).map(|response| ListPeersResult {
+            peers: response
+                .into_iter()
+                .map(|peer| PeerInfo {
+                    pubkey: peer.pubkey.into(),
+                    address: peer.address.to_string(),
+                })
+                .collect(),
+        })
+    }
+}

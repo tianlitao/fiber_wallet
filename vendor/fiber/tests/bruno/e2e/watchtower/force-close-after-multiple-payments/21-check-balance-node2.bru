@@ -1,0 +1,71 @@
+meta {
+  name: check balance, the difference should be the fee and invoice (3000000 - 1500000 - fee)
+  type: http
+  seq: 19
+}
+
+post {
+  url: {{CKB_RPC_URL}}
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  Accept: application/json
+}
+
+body:json {
+  {
+    "id": 42,
+    "jsonrpc": "2.0",
+    "method": "get_cells_capacity",
+    "params": [
+      {
+        "script_type": "lock"
+      }
+    ]
+  }
+}
+
+script:pre-request {
+  let script = bru.getVar("NODE2_FUNDING_SCRIPT");
+  let body = req.getBody();
+  body.params[0].script = script;
+  req.setBody(body);
+}
+
+vars:post-response {
+  BALANCE_CHECK_MAX_ITERATIONS: 6
+}
+
+assert {
+  res.body.error: isUndefined
+  res.body.result.capacity: isDefined
+}
+
+script:post-response {
+  const minDelta = BigInt("1498000");
+  const maxDelta = BigInt("1500000");
+  const delta = BigInt(res.body.result.capacity) - BigInt(bru.getVar("NODE2_BALANCE"));
+  const iteration = Number(bru.getVar("WATCHTOWER_BALANCE_CHECK_ITERATION") || 0);
+  const maxIterations = Number(bru.getVar("BALANCE_CHECK_MAX_ITERATIONS"));
+
+  if (delta > minDelta && delta < maxDelta) {
+    return;
+  }
+
+  if (iteration + 1 < maxIterations) {
+    console.log(
+      `Node2 balance is not settled yet: delta=${delta}, retry=${iteration + 1}/${maxIterations}`,
+    );
+    bru.setVar("WATCHTOWER_BALANCE_CHECK_ITERATION", iteration + 1);
+    bru.setNextRequest("generate a few blocks for final settlement tx to be committed");
+    return;
+  }
+
+  bru.setVar("WATCHTOWER_BALANCE_CHECK_ITERATION", 0);
+  throw new Error(
+    `Node2 balance delta=${delta} is outside expected range (${minDelta}, ${maxDelta})`,
+  );
+}

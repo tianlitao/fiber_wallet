@@ -1,0 +1,792 @@
+// The probability calculation is based on lnd's implementation,
+// https://github.com/lightningnetwork/lnd/blob/b7c59b36a74975c4e710a02ea42959053735402e/routing/probability_bimodal.go
+// we only use direct channel probability now.
+
+use super::graph::NetworkGraphStateStore;
+#[cfg(test)]
+use crate::mock_timestamp_as_millis_u64;
+use crate::now_timestamp_as_millis_u64;
+use ckb_types::packed::OutPoint;
+use fiber_types::{ChannelUpdate, Pubkey, SessionRouteNode, TlcErr, TlcErrData, TlcErrorCode};
+pub use fiber_types::{Direction, TimedResult};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use tracing::{debug, error};
+
+const DEFAULT_MIN_FAIL_RELAX_INTERVAL: u64 = 60 * 1000;
+
+// FIXME: this is a magic number from lnd, it's used to scale the amount to calculate the probability
+// lnd use 300_000_000 mili satoshis, we use shannons as the unit in fiber
+// we need to find a better way to set this value for UDT
+const DEFAULT_BIMODAL_SCALE_SHANNONS: f64 = 800_000_000.0;
+pub(crate) const DEFAULT_BIMODAL_DECAY_TIME: u64 = 30 * 60 * 1000; // 30 minutes
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SentNode {
+    Node1,
+    Node2,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct InternalPairResult {
+    pub(crate) success: bool,
+    pub(crate) time: u64,
+    pub(crate) amount: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct InternalResult {
+    pub pairs: HashMap<(OutPoint, Direction), InternalPairResult>,
+    pub nodes_to_channel_map: HashMap<Pubkey, HashSet<OutPoint>>,
+    pub fail_node: Option<Pubkey>,
+}
+
+pub(crate) fn output_direction(node1: Pubkey, node2: Pubkey) -> (Direction, Direction) {
+    if node1 < node2 {
+        (Direction::Forward, Direction::Backward)
+    } else {
+        (Direction::Backward, Direction::Forward)
+    }
+}
+
+impl InternalResult {
+    pub fn add(
+        &mut self,
+        node_1: Pubkey,
+        node_2: Pubkey,
+        channel: OutPoint,
+        time: u64,
+        amount: u128,
+        success: bool,
+    ) {
+        let (direction, _) = output_direction(node_1, node_2);
+        self.add_node_channel_map(node_1, channel.clone());
+        self.add_node_channel_map(node_2, channel.clone());
+        self.pairs.insert(
+            (channel, direction),
+            InternalPairResult {
+                success,
+                time,
+                amount,
+            },
+        );
+    }
+
+    fn add_node_channel_map(&mut self, node: Pubkey, channel: OutPoint) {
+        self.nodes_to_channel_map
+            .entry(node)
+            .or_default()
+            .insert(channel);
+    }
+
+    pub fn add_fail_pair(&mut self, from: Pubkey, target: Pubkey, channel: OutPoint) {
+        self.add(
+            from,
+            target,
+            channel.clone(),
+            now_timestamp_as_millis_u64(),
+            0,
+            false,
+        );
+        self.add(
+            target,
+            from,
+            channel,
+            now_timestamp_as_millis_u64(),
+            0,
+            false,
+        )
+    }
+
+    pub fn add_fail_pair_balanced(
+        &mut self,
+        from: Pubkey,
+        target: Pubkey,
+        channel: OutPoint,
+        amount: u128,
+    ) {
+        self.add(
+            from,
+            target,
+            channel,
+            now_timestamp_as_millis_u64(),
+            amount,
+            false,
+        );
+    }
+
+    pub fn fail_node(&mut self, nodes: &[SessionRouteNode], index: usize) {
+        self.fail_node = Some(nodes[index].pubkey);
+        if index > 0 {
+            self.fail_pair(nodes, index);
+        }
+        if index + 1 < nodes.len() {
+            self.fail_pair(nodes, index + 1);
+        }
+    }
+
+    pub fn fail_pair(&mut self, route: &[SessionRouteNode], index: usize) {
+        if index > 0 {
+            let a = route[index - 1].pubkey;
+            let b = route[index].pubkey;
+            let channel = route[index - 1].channel_outpoint.clone();
+            self.add_fail_pair(a, b, channel);
+        }
+    }
+
+    pub fn fail_pair_balanced(&mut self, nodes: &[SessionRouteNode], index: usize) {
+        if index > 0 {
+            let a = nodes[index - 1].pubkey;
+            let b = nodes[index].pubkey;
+            let amount = nodes[index].amount;
+            let channel = nodes[index - 1].channel_outpoint.clone();
+            self.add_fail_pair_balanced(a, b, channel, amount);
+        }
+    }
+
+    pub fn succeed_range_pairs(&mut self, nodes: &[SessionRouteNode], start: usize, end: usize) {
+        for i in start..end {
+            self.add(
+                nodes[i].pubkey,
+                nodes[i + 1].pubkey,
+                nodes[i].channel_outpoint.clone(),
+                now_timestamp_as_millis_u64(),
+                nodes[i].amount,
+                true,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub fn fail_range_pairs(&mut self, nodes: &[SessionRouteNode], start: usize, end: usize) {
+        for index in start.max(1)..=end {
+            self.fail_pair(nodes, index);
+        }
+    }
+
+    fn error_channel_is_adjacent_to_hop(
+        nodes: &[SessionRouteNode],
+        index: usize,
+        channel_outpoint: &OutPoint,
+    ) -> bool {
+        (index > 0 && nodes[index - 1].channel_outpoint == *channel_outpoint)
+            || (index + 1 < nodes.len() && nodes[index].channel_outpoint == *channel_outpoint)
+    }
+
+    fn error_attribution_matches_hop(
+        nodes: &[SessionRouteNode],
+        index: usize,
+        tlc_err: &TlcErr,
+    ) -> bool {
+        if index >= nodes.len() {
+            return false;
+        }
+
+        if let Some(node_id) = tlc_err.error_node_id() {
+            if node_id != nodes[index].pubkey {
+                return false;
+            }
+        }
+
+        if let Some(channel_outpoint) = tlc_err.error_channel_outpoint() {
+            return Self::error_channel_is_adjacent_to_hop(nodes, index, &channel_outpoint);
+        }
+
+        true
+    }
+
+    pub fn record_payment_fail_at_hop(
+        &mut self,
+        nodes: &[SessionRouteNode],
+        route_index: usize,
+        tlc_err: TlcErr,
+    ) -> bool {
+        if route_index >= nodes.len() {
+            error!(
+                "Authenticated error index out of route bounds: index={} route={:?} error={:?}",
+                route_index, nodes, tlc_err
+            );
+            return false;
+        }
+
+        if let Some(TlcErrData::TrampolineFailed { node_id, .. }) = &tlc_err.extra_data {
+            if *node_id == nodes[route_index].pubkey {
+                error!(
+                    "Payment failed beyond trampoline node: error_code={:?} trampoline_node={:?} route={:?}",
+                    tlc_err.error_code, node_id, nodes
+                );
+                return false;
+            }
+        }
+
+        let tlc_err = if Self::error_attribution_matches_hop(nodes, route_index, &tlc_err) {
+            tlc_err
+        } else {
+            error!(
+                "TLC error attribution does not match authenticated hop: authenticated_index={} authenticated_node={:?} error_node={:?} error_channel={:?}",
+                route_index,
+                nodes[route_index].pubkey,
+                tlc_err.error_node_id(),
+                tlc_err.error_channel_outpoint()
+            );
+            TlcErr::new_node_fail(TlcErrorCode::InvalidOnionError, nodes[route_index].pubkey)
+        };
+
+        self.record_payment_fail_with_index(nodes, route_index, tlc_err)
+    }
+
+    pub fn record_payment_fail(&mut self, nodes: &[SessionRouteNode], tlc_err: TlcErr) -> bool {
+        if let Some(TlcErrData::TrampolineFailed { node_id, .. }) = &tlc_err.extra_data {
+            error!(
+                "Payment failed beyond trampoline node: error_code={:?} trampoline_node={:?} route={:?}",
+                tlc_err.error_code, node_id, nodes
+            );
+            // The payer can decode the trampoline failure wrapper, but the inner route was chosen
+            // by the trampoline node and is not represented in this payment route. Do not penalize
+            // the visible route. Use the wrapped error code only to decide whether the payer may
+            // try another trampoline route.
+            return false;
+        }
+
+        let error_index = nodes
+            .iter()
+            .position(|s| Some(s.pubkey) == tlc_err.error_node_id());
+
+        let Some(index) = error_index else {
+            error!("Error index not found in the route: {:?}", tlc_err);
+            // if the error node is not in the route,
+            // and we can not penalize the source node (which is ourself)
+            // it's better to stop the payment session
+            return false;
+        };
+
+        self.record_payment_fail_with_index(nodes, index, tlc_err)
+    }
+
+    fn record_payment_fail_with_index(
+        &mut self,
+        nodes: &[SessionRouteNode],
+        index: usize,
+        tlc_err: TlcErr,
+    ) -> bool {
+        let mut need_retry = true;
+        let len = nodes.len();
+        if len < 2 {
+            error!("record_payment_fail_with_index called with fewer than 2 route nodes (len={}), ignoring", len);
+            return false;
+        }
+        let error_code = tlc_err.error_code;
+        error!(
+            "Payment failed at node index {}: len: {:?} error_code: {:?} error_node={:?} error_channel={:?} route={:?}",
+            index,
+            len,
+            error_code,
+            tlc_err.error_node_id(),
+            tlc_err.error_channel_outpoint(),
+            nodes
+        );
+        if index == 0 {
+            // we get error from the source node
+            match error_code {
+                TlcErrorCode::InvalidOnionVersion
+                | TlcErrorCode::InvalidOnionHmac
+                | TlcErrorCode::InvalidOnionKey
+                | TlcErrorCode::InvalidOnionPayload
+                | TlcErrorCode::IncorrectOrUnknownPaymentDetails
+                | TlcErrorCode::InvoiceExpired
+                | TlcErrorCode::InvoiceCancelled
+                | TlcErrorCode::UnknownNextPeer
+                | TlcErrorCode::RequiredNodeFeatureMissing
+                | TlcErrorCode::ExpiryTooSoon
+                | TlcErrorCode::ExpiryTooFar
+                | TlcErrorCode::HoldTlcTimeout => {
+                    need_retry = false;
+                }
+                TlcErrorCode::TemporaryChannelFailure => {
+                    self.fail_pair_balanced(nodes, index + 1);
+                }
+                _ => {
+                    // we can not penalize our own node, the whole payment session need to retry
+                }
+            }
+        } else if index == len - 1 {
+            match error_code {
+                TlcErrorCode::FinalIncorrectExpiryDelta | TlcErrorCode::FinalIncorrectTlcAmount => {
+                    if len == 2 {
+                        need_retry = false;
+                        self.fail_node(nodes, len - 1);
+                    } else {
+                        // maybe the previous hop is malicious
+                        self.fail_pair(nodes, index - 1);
+                        self.succeed_range_pairs(nodes, 0, index - 2);
+                    }
+                }
+                TlcErrorCode::IncorrectOrUnknownPaymentDetails
+                | TlcErrorCode::RequiredNodeFeatureMissing
+                | TlcErrorCode::RequiredChannelFeatureMissing
+                | TlcErrorCode::PermanentNodeFailure
+                | TlcErrorCode::InvoiceExpired
+                | TlcErrorCode::InvoiceCancelled
+                | TlcErrorCode::HoldTlcTimeout => {
+                    need_retry = false;
+                    self.succeed_range_pairs(nodes, 0, len - 1);
+                }
+                TlcErrorCode::ExpiryTooSoon | TlcErrorCode::ExpiryTooFar => {
+                    // these two error code will not be reported from last hop in theory
+                    // anyway, don't retry payment anymore
+                    need_retry = false;
+                }
+                _ => {
+                    self.fail_node(nodes, len - 1);
+                    if len > 1 {
+                        self.succeed_range_pairs(nodes, 0, len - 2);
+                    }
+                }
+            }
+        } else {
+            match error_code {
+                TlcErrorCode::InvalidOnionVersion
+                | TlcErrorCode::InvalidOnionHmac
+                | TlcErrorCode::InvalidOnionKey
+                | TlcErrorCode::InvalidOnionError
+                | TlcErrorCode::IncorrectTlcDirection => {
+                    self.fail_pair(nodes, index);
+                }
+                TlcErrorCode::InvalidOnionPayload => {
+                    self.fail_node(nodes, index);
+                    if index > 1 {
+                        self.succeed_range_pairs(nodes, 0, index - 1);
+                    }
+                }
+                TlcErrorCode::UnknownNextPeer => {
+                    self.fail_pair(nodes, index + 1);
+                }
+                TlcErrorCode::PermanentChannelFailure => {
+                    self.fail_pair(nodes, index + 1);
+                }
+                TlcErrorCode::FeeInsufficient => {
+                    need_retry = true;
+                    self.fail_pair_balanced(nodes, index + 1);
+                    if index > 1 {
+                        self.succeed_range_pairs(nodes, 0, index);
+                    }
+                }
+                TlcErrorCode::IncorrectTlcExpiry => {
+                    need_retry = false;
+                    self.fail_pair(nodes, index);
+                    if index > 1 {
+                        self.succeed_range_pairs(nodes, 0, index - 1);
+                    }
+                }
+                TlcErrorCode::TemporaryChannelFailure
+                | TlcErrorCode::ChannelDisabled
+                | TlcErrorCode::TemporaryNodeFailure
+                | TlcErrorCode::RequiredNodeFeatureMissing
+                | TlcErrorCode::AmountBelowMinimum => {
+                    self.fail_pair_balanced(nodes, index + 1);
+                    self.succeed_range_pairs(nodes, 0, index);
+                }
+                TlcErrorCode::ExpiryTooSoon | TlcErrorCode::ExpiryTooFar => {
+                    self.succeed_range_pairs(nodes, 0, index);
+                }
+                TlcErrorCode::IncorrectOrUnknownPaymentDetails => {
+                    need_retry = false;
+                }
+                TlcErrorCode::InvoiceExpired
+                | TlcErrorCode::InvoiceCancelled
+                | TlcErrorCode::FinalIncorrectExpiryDelta
+                | TlcErrorCode::FinalIncorrectTlcAmount
+                | TlcErrorCode::HoldTlcTimeout => {
+                    error!(
+                        "middle hop does not expect to report this error: {:?}",
+                        error_code
+                    );
+                    need_retry = false;
+                }
+                TlcErrorCode::PermanentNodeFailure
+                | TlcErrorCode::RequiredChannelFeatureMissing => {
+                    self.fail_node(nodes, index);
+                }
+            }
+        }
+        need_retry
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PaymentHistory<S> {
+    pub inner: HashMap<(OutPoint, Direction), TimedResult>,
+    pub nodes_to_channel_map: HashMap<Pubkey, HashSet<OutPoint>>,
+    // The minimum interval between two failed payments in milliseconds
+    pub min_fail_relax_interval: u64,
+    pub bimodal_scale_msat: f64,
+    // this filed is used to check whether from is the source Node
+    // will be used after enabling the direct channel related logic
+    #[allow(dead_code)]
+    pub source: Pubkey,
+    store: S,
+}
+
+impl<S> PaymentHistory<S>
+where
+    S: NetworkGraphStateStore + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn new(source: Pubkey, min_fail_relax_interval: Option<u64>, store: S) -> Self {
+        let mut s = PaymentHistory {
+            source,
+            inner: HashMap::new(),
+            nodes_to_channel_map: HashMap::new(),
+            min_fail_relax_interval: min_fail_relax_interval
+                .unwrap_or(DEFAULT_MIN_FAIL_RELAX_INTERVAL),
+            bimodal_scale_msat: DEFAULT_BIMODAL_SCALE_SHANNONS,
+            store,
+        };
+        s.load_from_store();
+        s
+    }
+
+    #[cfg(any(test, feature = "bench"))]
+    pub(crate) fn reset(&mut self) {
+        self.inner.clear();
+        self.nodes_to_channel_map.clear();
+    }
+
+    pub(crate) fn add_result(
+        &mut self,
+        channel: OutPoint,
+        direction: Direction,
+        result: TimedResult,
+    ) {
+        self.inner.insert((channel.clone(), direction), result);
+        self.save_result(channel, direction, result);
+    }
+
+    fn save_result(&mut self, channel: OutPoint, direction: Direction, result: TimedResult) {
+        self.store
+            .insert_payment_history_result(channel, direction, result);
+    }
+
+    pub(crate) fn add_node_channel_map(&mut self, node: Pubkey, channel: OutPoint) {
+        self.nodes_to_channel_map
+            .entry(node)
+            .or_default()
+            .insert(channel);
+    }
+
+    pub(crate) fn load_from_store(&mut self) {
+        let results = self.store.get_payment_history_results();
+        for (channel, direction, result) in results.into_iter() {
+            self.inner.insert((channel, direction), result);
+        }
+    }
+
+    pub(crate) fn remove_channel_history(&mut self, channel_outpoint: &OutPoint) {
+        self.store.remove_channel_history(channel_outpoint);
+        self.inner
+            .retain(|(outpoint, _), _| outpoint != channel_outpoint);
+    }
+
+    pub(crate) fn apply_pair_result(
+        &mut self,
+        channel: OutPoint,
+        direction: Direction,
+        amount: u128,
+        success: bool,
+        time: u64,
+    ) {
+        let min_fail_relax_interval = self.min_fail_relax_interval;
+        let result = if let Some(current) = self.get_mut_result(channel.clone(), direction) {
+            if success {
+                current.success_time = time;
+                if amount > current.success_amount {
+                    current.success_amount = amount;
+                }
+                if current.fail_time != 0 && amount >= current.fail_amount {
+                    current.fail_amount = amount + 1;
+                }
+            } else {
+                if amount > current.fail_amount
+                    && current.fail_time != 0
+                    && time.saturating_sub(current.fail_time) < min_fail_relax_interval
+                {
+                    return;
+                }
+                current.fail_amount = amount;
+                current.fail_time = time;
+                if amount == 0 {
+                    current.success_amount = 0;
+                } else if amount <= current.success_amount {
+                    current.success_amount = amount.saturating_sub(1);
+                }
+            }
+            // make sure success_amount is less than or equal to fail_amount,
+            // so that we can calculate the probability in a amount range.
+            assert!(current.fail_time == 0 || current.success_amount <= current.fail_amount);
+            *current
+        } else {
+            TimedResult {
+                fail_time: if success { 0 } else { time },
+                fail_amount: if success { 0 } else { amount },
+                success_time: if success { time } else { 0 },
+                success_amount: if success { amount } else { 0 },
+            }
+        };
+        self.add_result(channel, direction, result);
+    }
+
+    pub(crate) fn apply_internal_result(&mut self, result: InternalResult) {
+        let InternalResult {
+            pairs,
+            fail_node,
+            nodes_to_channel_map,
+        } = result;
+        for ((channel, direction), pair_result) in pairs.into_iter() {
+            self.apply_pair_result(
+                channel,
+                direction,
+                pair_result.amount,
+                pair_result.success,
+                pair_result.time,
+            );
+        }
+        for (node, channels) in nodes_to_channel_map.into_iter() {
+            self.nodes_to_channel_map
+                .entry(node)
+                .or_default()
+                .extend(channels);
+        }
+        if let Some(fail_node) = fail_node {
+            let channels = self
+                .nodes_to_channel_map
+                .get(&fail_node)
+                .expect("channels not found");
+            let pairs: Vec<(OutPoint, Direction)> = self
+                .inner
+                .iter()
+                .flat_map(|((outpoint, direction), _)| {
+                    if channels.contains(outpoint) {
+                        Some((outpoint.clone(), *direction))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for (channel, direction) in pairs.into_iter() {
+                self.apply_pair_result(channel, direction, 0, false, now_timestamp_as_millis_u64());
+            }
+        }
+    }
+
+    pub(crate) fn get_result(
+        &self,
+        channel: &OutPoint,
+        direction: Direction,
+    ) -> Option<&TimedResult> {
+        self.inner.get(&(channel.clone(), direction))
+    }
+
+    pub(crate) fn get_mut_result(
+        &mut self,
+        channel: OutPoint,
+        direction: Direction,
+    ) -> Option<&mut TimedResult> {
+        self.inner.get_mut(&(channel, direction))
+    }
+
+    pub(crate) fn eval_probability(
+        &self,
+        from: Pubkey,
+        target: Pubkey,
+        channel: &OutPoint,
+        amount: u128,
+        capacity: u128,
+    ) -> f64 {
+        let mut success_amount = 0;
+        let mut fail_amount = capacity;
+        let (direction, _) = output_direction(from, target);
+        if let Some(result) = self.get_result(channel, direction) {
+            if result.fail_time != 0 {
+                fail_amount = self.cannot_send(result.fail_amount, result.fail_time, capacity);
+            }
+            if result.success_time != 0 {
+                success_amount = result.success_amount;
+            }
+        } else {
+            // if we don't have the history, we assume the probability is 1.0
+            return 1.0;
+        }
+        let ret = self.get_channel_probability(capacity, success_amount, fail_amount, amount);
+        assert!((0.0..=1.0).contains(&ret));
+        ret
+    }
+
+    // This factor approaches from 1 to 0 with time_elapsed getting larger,
+    // is 1 when the success_time is now.
+    fn time_factor(&self, time: u64) -> f64 {
+        #[cfg(not(test))]
+        let cur_time = now_timestamp_as_millis_u64();
+        #[cfg(test)]
+        let cur_time = mock_timestamp_as_millis_u64();
+        let time_elapsed = cur_time.saturating_sub(time);
+        let exponent = -(time_elapsed as f64) / (DEFAULT_BIMODAL_DECAY_TIME as f64);
+        exponent.exp()
+    }
+
+    // with time passing, cannot_send return amount increasing, until it reach capacity
+    // implies a channel marked with failed status will increasing it's probability gradually
+    pub(crate) fn cannot_send(&self, fail_amount: u128, time: u64, capacity: u128) -> u128 {
+        let mut fail_amount = fail_amount;
+
+        if fail_amount > capacity {
+            fail_amount = capacity;
+        }
+
+        let factor = self.time_factor(time);
+        let fail_amount = fail_amount.max(1);
+        (fail_amount.saturating_mul((1.0 / factor) as u128)).min(capacity)
+    }
+
+    // Get the probability of a payment success through a direct channel,
+    // suppose we know the accurate balance for direct channels, so we don't need to use `get_channel_probability`
+    // for the direct channel, this function is used disable the direct channel for a time period if it's failed
+    // currently we may mark the channel failed on graph level, so this function is not used now.
+    // FIXME: reconsider this after we already got the accurate balance of direct channels
+    //        related issue: https://github.com/nervosnetwork/fiber/issues/257
+    #[allow(dead_code)]
+    pub(crate) fn get_direct_probability(&self, channel: &OutPoint, direction: Direction) -> f64 {
+        let mut prob = 1.0;
+        if let Some(result) = self.get_result(channel, direction) {
+            if result.fail_time != 0 {
+                let elapsed = now_timestamp_as_millis_u64().saturating_sub(result.fail_time);
+                let exponent = -(elapsed as f64) / (DEFAULT_BIMODAL_DECAY_TIME as f64);
+                prob -= exponent.exp();
+            }
+        }
+        prob
+    }
+
+    // Get the probability of a payment success through a channel
+    // The probability is calculated based on the history of the channel
+    // Suppose the range of amount:
+    // ---------------------- success_amount ++++++++++++++++++++++++ fail_amount xxxxxxxxxxxxxxxxxxxxxx
+    //        must be succeed       |        may be succeed           |       must be failed
+    // The probability is calculated as:
+    // 1. If the amount is less than or equal to success_amount, return 1.0
+    // 2. If the amount is greater than fail_amount, return 0.0
+    // 3. Otherwise, calculate the probability based on the time and capacity of the channel
+    pub(crate) fn get_channel_probability(
+        &self,
+        capacity: u128,
+        success_amount: u128,
+        fail_amount: u128,
+        amount: u128,
+    ) -> f64 {
+        if amount > capacity || amount == 0 || capacity == 0 {
+            return 0.0;
+        }
+
+        let fail_amount = fail_amount.min(capacity);
+        let success_amount = success_amount.min(capacity);
+
+        if fail_amount == success_amount {
+            // if the graph has latest information
+            // we don't continue to calculate the probability
+            if amount <= capacity {
+                return 1.0;
+            }
+            return 0.0;
+        }
+
+        if fail_amount < success_amount {
+            // suppose a malioucious node report wrong information
+            // here we return 0.0 to avoid to choose this channel
+            error!(
+                "fail_amount: {} < success_amount: {}",
+                fail_amount, success_amount
+            );
+            return 0.0;
+        }
+
+        if amount >= fail_amount {
+            return 0.0;
+        }
+
+        // safely convert amount, success_amount, fail_amount to f64
+        let amount = amount as f64;
+        let success_amount = success_amount as f64;
+        let fail_amount = fail_amount as f64;
+
+        // f128 is only on nightly, so we use f64 here, we may lose some precision
+        // but it's acceptable since all the values are cast to f64
+        let mut prob = self.integral_probability(capacity as f64, amount, fail_amount);
+        if prob.is_nan() {
+            error!(
+                "probability is NaN: capacity: {} amount: {} fail_amount: {}",
+                capacity, amount, fail_amount
+            );
+            return 0.0;
+        }
+        let re_norm = self.integral_probability(capacity as f64, success_amount, fail_amount);
+        if re_norm == 0.0 {
+            return 0.0;
+        }
+        prob /= re_norm;
+        prob = prob.clamp(0.0, 1.0);
+        return prob;
+    }
+
+    fn primitive(&self, c: f64, x: f64) -> f64 {
+        let s = self.bimodal_scale_msat;
+
+        // The indefinite integral of P(x) is given by
+        // Int P(x) dx = H(x) = s * (-e(-x/s) + e((x-c)/s)),
+        // and its norm from 0 to c can be computed from it,
+        // norm = [H(x)]_0^c = s * (-e(-c/s) + 1 -(1 + e(-c/s))).
+        let ecs = (-c / s).exp();
+        let exs = (-x / s).exp();
+
+        // It would be possible to split the next term and reuse the factors
+        // from before, but this can lead to numerical issues with large
+        // numbers.
+        let excs = ((x - c) / s).exp();
+
+        // norm can only become zero, if c is zero, which we sorted out before
+        // calling this method.
+        let norm = -2.0 * ecs + 2.0;
+
+        // We end up with the primitive function of the normalized P(x).
+        (-exs + excs) / norm
+    }
+
+    fn integral_probability(&self, capacity: f64, lower: f64, upper: f64) -> f64 {
+        if lower < 0.0 || lower > upper {
+            debug!(
+                "probability integral limits nonsensical: capacity: {} lower: {} upper: {}",
+                capacity, lower, upper
+            );
+            return 0.0;
+        }
+
+        self.primitive(capacity, upper) - self.primitive(capacity, lower)
+    }
+
+    pub(crate) fn process_channel_update(&mut self, channel_update: &ChannelUpdate) {
+        if channel_update.is_disabled() {
+            return;
+        }
+
+        let channel_outpoint = channel_update.channel_outpoint.clone();
+        let direction = if channel_update.is_update_of_node_1() {
+            Direction::Forward
+        } else {
+            Direction::Backward
+        };
+
+        if let Some(record) = self.get_result(&channel_outpoint, direction) {
+            if record.fail_amount == 0 && record.success_amount == 0 {
+                self.inner.remove(&(channel_outpoint, direction));
+            }
+        }
+    }
+}

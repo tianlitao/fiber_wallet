@@ -1,0 +1,27 @@
+name: Unittests for wasm32-unknown-unknown
+on:
+  push:
+    branches: develop
+  workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  unit-test:
+    name: Run unit tests in browser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dsherret/rust-toolchain-file@v1
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run tests (without async-trait)
+        run: |
+          make wasm-test
+

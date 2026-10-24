@@ -1,0 +1,312 @@
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::ops::Bound;
+use std::sync::Arc;
+use tracing::info;
+
+use crate::backend::StorageBackend;
+use crate::iterator::{IteratorDirection, KVPair};
+
+/// Minimal object-safe store trait for migration operations.
+/// All `StorageBackend` implementations automatically implement this.
+pub trait MigrationStore {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
+    fn put(&self, key: &[u8], value: &[u8]);
+
+    /// Collect all key-value pairs whose keys start with the given prefix.
+    fn collect_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>;
+}
+
+impl<T: StorageBackend + ?Sized> MigrationStore for T {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        StorageBackend::get(self, key)
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) {
+        StorageBackend::put(self, key, value)
+    }
+
+    fn collect_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let owned_prefix = prefix.to_vec();
+        let pairs: Vec<KVPair> = self.collect_iterator(
+            owned_prefix.clone(),
+            IteratorDirection::Forward,
+            Box::new(move |key| key.starts_with(&owned_prefix)),
+            0,
+        );
+        pairs.into_iter().map(|kv| (kv.key, kv.value)).collect()
+    }
+}
+
+pub const MIGRATION_VERSION_KEY: &[u8] = b"db-version";
+pub const INIT_DB_VERSION: &str = "20260302100001";
+include!(concat!(env!("OUT_DIR"), "/latest_db_version.rs"));
+
+// --- Callback types for platform-specific UI ---
+
+/// Describes a pending migration plan for user confirmation.
+pub struct MigrationPlan {
+    pub current_version: String,
+    pub target_version: String,
+    pub pending_count: usize,
+    pub has_break_change: bool,
+    pub message: String,
+}
+
+/// Reports progress of an in-flight migration step.
+pub struct MigrationProgress {
+    pub current_step: usize,
+    pub total_steps: usize,
+    pub current_version: String,
+    pub message: String,
+}
+
+/// Migration-specific errors.
+pub enum MigrateError {
+    UserCancelled,
+    DatabaseTooOld {
+        db_version: String,
+        min_version: String,
+    },
+    DatabaseTooNew {
+        db_version: String,
+        latest_version: String,
+    },
+    MigrationFailed {
+        version: String,
+        error: String,
+    },
+}
+
+impl std::fmt::Display for MigrateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MigrateError::UserCancelled => write!(f, "Migration cancelled by user"),
+            MigrateError::DatabaseTooOld {
+                db_version,
+                min_version,
+            } => {
+                write!(
+                    f,
+                    "Database version {} is too old. Minimum supported version is {}. \
+                     Please use fnn-migrate v0.8.x to upgrade first.",
+                    db_version, min_version
+                )
+            }
+            MigrateError::DatabaseTooNew {
+                db_version,
+                latest_version,
+            } => {
+                write!(
+                    f,
+                    "Database version {} is newer than the latest supported version {}. \
+                     Please upgrade the fiber binary.",
+                    db_version, latest_version
+                )
+            }
+            MigrateError::MigrationFailed { version, error } => {
+                write!(f, "Migration {} failed: {}", version, error)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for MigrateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for MigrateError {}
+
+/// Platform-specific confirmation callback.
+/// Receives a MigrationPlan, returns true if user confirms.
+pub type MigrateConfirmFn = Box<dyn FnOnce(MigrationPlan) -> bool>;
+
+/// Platform-specific progress callback.
+/// Called before each migration step executes.
+pub type MigrateProgressFn = Box<dyn Fn(MigrationProgress)>;
+
+// --- Migration trait ---
+
+pub trait Migration: Send + Sync {
+    /// Timestamp-based version string: "YYYYMMDDHHMMSS"
+    fn version(&self) -> &str;
+
+    /// Execute migration using a storage backend.
+    fn migrate(&self, store: &dyn MigrationStore) -> Result<(), String>;
+
+    /// Whether this migration is a breaking change requiring user action.
+    fn is_break_change(&self) -> bool {
+        false
+    }
+}
+
+// --- Migrations registry ---
+
+#[derive(Default)]
+pub struct Migrations {
+    migrations: BTreeMap<String, Arc<dyn Migration>>,
+}
+
+impl Migrations {
+    pub fn add_migration(&mut self, migration: Arc<dyn Migration>) {
+        self.migrations
+            .insert(migration.version().to_string(), migration);
+    }
+
+    pub fn get_db_version<S: StorageBackend>(&self, store: &S) -> Option<String> {
+        store
+            .get(MIGRATION_VERSION_KEY)
+            .and_then(|v| String::from_utf8(v).ok())
+    }
+
+    /// Check database version against binary version.
+    pub fn check<S: StorageBackend>(&self, store: &S) -> Ordering {
+        let db_version = match self.get_db_version(store) {
+            Some(v) => v,
+            None => return Ordering::Less,
+        };
+        eprintln!(
+            "Current database version: [{}], latest db version: [{}]",
+            db_version, LATEST_DB_VERSION
+        );
+        db_version.as_str().cmp(LATEST_DB_VERSION)
+    }
+
+    /// Initialize a new database with LATEST_DB_VERSION.
+    pub fn init_db_version<S: StorageBackend>(&self, store: &S) {
+        info!("Init database version {}", LATEST_DB_VERSION);
+        store.put(MIGRATION_VERSION_KEY, LATEST_DB_VERSION);
+    }
+
+    /// Collect pending migrations (version > current).
+    fn pending_migrations(&self, current_version: &str) -> Vec<&Arc<dyn Migration>> {
+        self.migrations
+            .range((
+                Bound::Excluded(current_version.to_string()),
+                Bound::Unbounded,
+            ))
+            .map(|(_, m)| m)
+            .collect()
+    }
+
+    /// Check if any pending migration is a breaking change.
+    fn has_break_change(&self, current_version: &str) -> bool {
+        self.pending_migrations(current_version)
+            .iter()
+            .any(|m| m.is_break_change())
+    }
+
+    /// Effective latest version: the maximum of `LATEST_DB_VERSION` and the
+    /// highest version among registered migrations. This allows dynamically
+    /// added migrations (e.g. in tests) to extend beyond the compile-time constant.
+    fn effective_latest_version(&self) -> &str {
+        match self.migrations.keys().last() {
+            Some(max_registered) if max_registered.as_str() > LATEST_DB_VERSION => {
+                max_registered.as_str()
+            }
+            _ => LATEST_DB_VERSION,
+        }
+    }
+
+    /// Run the full auto-migration flow.
+    pub fn auto_migrate<S: StorageBackend>(
+        &self,
+        store: &S,
+        confirm_fn: MigrateConfirmFn,
+        progress_fn: MigrateProgressFn,
+    ) -> Result<(), MigrateError> {
+        let latest_version = self.effective_latest_version();
+
+        let db_version = match self.get_db_version(store) {
+            None => {
+                // New database -- stamp with latest version
+                self.init_db_version(store);
+                return Ok(());
+            }
+            Some(v) => v,
+        };
+
+        // Already up to date
+        if db_version.as_str() == latest_version {
+            info!(
+                "Database version {} is current, no migration needed",
+                db_version
+            );
+            return Ok(());
+        }
+
+        // Database too new
+        if db_version.as_str() > latest_version {
+            return Err(MigrateError::DatabaseTooNew {
+                db_version,
+                latest_version: latest_version.to_string(),
+            });
+        }
+
+        // Database too old (before new epoch)
+        if db_version.as_str() < INIT_DB_VERSION {
+            return Err(MigrateError::DatabaseTooOld {
+                db_version,
+                min_version: INIT_DB_VERSION.to_string(),
+            });
+        }
+
+        // Collect pending migrations
+        let pending = self.pending_migrations(&db_version);
+        if pending.is_empty() {
+            // Between INIT and LATEST but no migrations to run
+            self.init_db_version(store);
+            return Ok(());
+        }
+
+        let has_break = self.has_break_change(&db_version);
+
+        // Build plan and request confirmation
+        let plan = MigrationPlan {
+            current_version: db_version.clone(),
+            target_version: latest_version.to_string(),
+            pending_count: pending.len(),
+            has_break_change: has_break,
+            message: format!(
+                "Database migration required ({} -> {}), {} pending migration(s).{}",
+                db_version,
+                latest_version,
+                pending.len(),
+                if has_break {
+                    " WARNING: Contains breaking changes -- backup strongly recommended."
+                } else {
+                    " Backup recommended."
+                }
+            ),
+        };
+
+        if !confirm_fn(plan) {
+            return Err(MigrateError::UserCancelled);
+        }
+
+        // Execute migrations
+        let total = pending.len();
+        for (idx, m) in pending.iter().enumerate() {
+            progress_fn(MigrationProgress {
+                current_step: idx + 1,
+                total_steps: total,
+                current_version: m.version().to_string(),
+                message: format!("Migrating v{}", m.version()),
+            });
+
+            m.migrate(store)
+                .map_err(|e| MigrateError::MigrationFailed {
+                    version: m.version().to_string(),
+                    error: e,
+                })?;
+
+            // Update db-version after each successful migration
+            store.put(MIGRATION_VERSION_KEY, m.version());
+        }
+
+        info!("Migration complete: {} -> {}", db_version, latest_version);
+        Ok(())
+    }
+}

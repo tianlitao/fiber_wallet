@@ -1,0 +1,19 @@
+[package]
+name = "nsh-app-fiber-wallet-ios"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "NSH (Native Shell) iOS shell for the Fiber wallet: bottom-tab UI over the shared wallet bridge, Keychain-backed secret password"
+
+[workspace]
+
+[dependencies]
+fiber_wallet_core = { path = "../core" }
+nsh-core = "0.2.0"
+nsh-base = "0.2.0"
+tracing = "0.1"
+security-framework = "3"
+
+# The macOS shell owns the bridge, theme, widgets, and pages; the iOS shell
+# reuses them and swaps the desktop sidebar for a bottom tab bar.
+nsh-app-fiber-wallet-nsh = { path = "../nsh_app" }

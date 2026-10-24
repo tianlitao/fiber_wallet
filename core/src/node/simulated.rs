@@ -1,0 +1,154 @@
+use std::sync::Mutex;
+use std::time::Duration;
+
+use crate::types::{NodeNetwork, NodePhase, NodeSnapshot};
+use crate::types::{WalletChannel, WalletInvoice, WalletNodeInfo, WalletPayment};
+
+const START_DELAY: Duration = Duration::from_millis(300);
+const STOP_DELAY: Duration = Duration::from_millis(180);
+
+/// Simulated node lifecycle used by Web and unit tests.
+pub struct NodeMachine {
+    state: Mutex<NodeSnapshot>,
+    operation: tokio::sync::Mutex<()>,
+}
+
+impl NodeMachine {
+    pub fn new(network: NodeNetwork, _data_dir: String, _secret_password: String) -> Self {
+        Self {
+            state: Mutex::new(NodeSnapshot {
+                phase: NodePhase::Stopped,
+                network,
+                detail: "Local node is stopped".to_owned(),
+                node_id: None,
+                backend: "simulated (M0)".to_owned(),
+            }),
+            operation: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn snapshot(&self) -> NodeSnapshot {
+        self.state.lock().expect("node state poisoned").clone()
+    }
+
+    pub async fn start(&self) -> Result<NodeSnapshot, String> {
+        let _operation = self.operation.lock().await;
+        {
+            let mut state = self.state.lock().expect("node state poisoned");
+            if matches!(state.phase, NodePhase::Starting | NodePhase::Running) {
+                return Ok(state.clone());
+            }
+            state.phase = NodePhase::Starting;
+            state.detail = "Starting simulated local node".to_owned();
+            state.node_id = None;
+        }
+
+        tokio::time::sleep(START_DELAY).await;
+
+        let mut state = self.state.lock().expect("node state poisoned");
+        state.phase = NodePhase::Running;
+        state.detail = "Simulated local node is running while the app is active".to_owned();
+        state.node_id = Some("02simulated-local-node".to_owned());
+        Ok(state.clone())
+    }
+
+    pub async fn stop(&self) -> Result<NodeSnapshot, String> {
+        let _operation = self.operation.lock().await;
+        {
+            let mut state = self.state.lock().expect("node state poisoned");
+            if matches!(state.phase, NodePhase::Stopping | NodePhase::Stopped) {
+                return Ok(state.clone());
+            }
+            state.phase = NodePhase::Stopping;
+            state.detail = "Stopping simulated local node".to_owned();
+        }
+
+        tokio::time::sleep(STOP_DELAY).await;
+
+        let mut state = self.state.lock().expect("node state poisoned");
+        state.phase = NodePhase::Stopped;
+        state.detail = "Local node is offline".to_owned();
+        state.node_id = None;
+        Ok(state.clone())
+    }
+
+    pub fn mark_failed(&self, message: String) -> NodeSnapshot {
+        let mut state = self.state.lock().expect("node state poisoned");
+        state.phase = NodePhase::Failed;
+        state.detail = message;
+        state.node_id = None;
+        state.clone()
+    }
+}
+
+// Wallet operations are only implemented by the native backend; the simulated
+// backend exists for web and unit tests, where there is no Fiber node.
+impl NodeMachine {
+    fn wallet_unavailable<T>() -> Result<T, String> {
+        Err("wallet operations require the native node backend".to_owned())
+    }
+
+    pub async fn wallet_node_info(&self) -> Result<WalletNodeInfo, String> {
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_list_channels(&self) -> Result<Vec<WalletChannel>, String> {
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_new_invoice(
+        &self,
+        _amount_shannons: u64,
+        _description: String,
+    ) -> Result<WalletInvoice, String> {
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_list_payments(&self, _limit: u32) -> Result<Vec<WalletPayment>, String> {
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_get_payment(&self, _payment_hash: String) -> Result<WalletPayment, String> {
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_send_payment(&self, _invoice: String) -> Result<WalletPayment, String> {
+        Self::wallet_unavailable()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn starts_and_stops() {
+        let node = NodeMachine::new(
+            NodeNetwork::Testnet,
+            "unused".to_owned(),
+            "unused".to_owned(),
+        );
+
+        assert_eq!(node.snapshot().phase, NodePhase::Stopped);
+        let running = node.start().await.expect("start");
+        assert_eq!(running.phase, NodePhase::Running);
+        assert!(running.node_id.is_some());
+
+        let stopped = node.stop().await.expect("stop");
+        assert_eq!(stopped.phase, NodePhase::Stopped);
+        assert!(stopped.node_id.is_none());
+    }
+
+    #[test]
+    fn transitions_to_failed() {
+        let node = NodeMachine::new(
+            NodeNetwork::Testnet,
+            "unused".to_owned(),
+            "unused".to_owned(),
+        );
+        let failed = node.mark_failed("database lock failed".to_owned());
+
+        assert_eq!(failed.phase, NodePhase::Failed);
+        assert_eq!(failed.detail, "database lock failed");
+    }
+}

@@ -1,0 +1,15 @@
+[files]
+extend-exclude = [
+  "*.patch",   # Automatically generated files that should not be manually modified.
+  "*.bin",     # Binary files
+  ".git/",     # Version control files
+]
+ignore-hidden = false
+
+[default.extend-identifiers]
+ba = "ba"
+
+[default]
+extend-ignore-re = [
+  ".*=" # ignore base64 string
+]

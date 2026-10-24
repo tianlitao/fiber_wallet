@@ -1,0 +1,539 @@
+//! Unit tests for backend dispatchers
+
+use crate::cch::actions::{
+    backend_dispatchers::{
+        dispatch_invoice_handler, dispatch_payment_handler, InvoiceHandlerType, PaymentHandlerType,
+    },
+    cancel_incoming_invoice::CancelIncomingInvoiceDispatcher,
+    send_outgoing_payment::SendOutgoingPaymentDispatcher,
+    settle_incoming_invoice::SettleIncomingInvoiceDispatcher,
+    track_incoming_invoice::TrackIncomingInvoiceDispatcher,
+    track_outgoing_payment::TrackOutgoingPaymentDispatcher,
+    ActionDispatcher, CchOrderAction,
+};
+use fiber_types::{CchInvoice, CchOrder, CchOrderStatus, Hash256};
+
+/// Helper to create a test payment hash
+fn test_payment_hash(value: u8) -> Hash256 {
+    let mut bytes = [0u8; 32];
+    bytes[0] = value;
+    Hash256::from(bytes)
+}
+
+/// Create a test Lightning invoice by parsing a valid invoice string
+fn create_test_lightning_invoice() -> lightning_invoice::Bolt11Invoice {
+    // A valid mainnet Lightning invoice for testing
+    let invoice_str = "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
+    invoice_str.parse().unwrap()
+}
+
+/// Create a test order with a Lightning incoming invoice
+fn create_order_with_lightning_invoice(status: CchOrderStatus) -> CchOrder {
+    let invoice = create_test_lightning_invoice();
+
+    CchOrder {
+        created_at: 1000,
+        expiry_delta_seconds: 3600,
+        wrapped_btc_type_script: ckb_jsonrpc_types::Script {
+            code_hash: Default::default(),
+            hash_type: ckb_jsonrpc_types::ScriptHashType::Data,
+            args: Default::default(),
+        },
+        outgoing_pay_req: "fibb1280...".to_string(),
+        incoming_invoice: CchInvoice::Lightning(invoice),
+        payment_hash: test_payment_hash(1),
+        payment_preimage: None,
+        amount_sats: 100000,
+        fee_sats: 100,
+        status,
+        failure_reason: None,
+    }
+}
+
+/// Create a test order with a Fiber incoming invoice.
+/// Since we can't easily create a real CkbInvoice without signing,
+/// we use a different approach by parsing from a string representation.
+fn create_order_with_fiber_invoice(status: CchOrderStatus) -> CchOrder {
+    use crate::invoice::{Attribute, CkbInvoice, Currency, InvoiceData};
+    use crate::time::{Duration, SystemTime, UNIX_EPOCH};
+    use secp256k1::{Secp256k1, SecretKey};
+
+    // Create a deterministic keypair for tests
+    let private_key = SecretKey::from_slice(&[42u8; 32]).unwrap();
+    let public_key = secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), &private_key);
+
+    let payment_hash = test_payment_hash(1);
+
+    let mut invoice = CkbInvoice {
+        currency: Currency::Fibb,
+        amount: Some(100000),
+        signature: None,
+        data: InvoiceData {
+            payment_hash,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            attrs: vec![
+                Attribute::FinalHtlcMinimumExpiryDelta(12),
+                Attribute::Description("test".to_string()),
+                Attribute::ExpiryTime(Duration::from_secs(3600)),
+                Attribute::PayeePublicKey(public_key),
+            ],
+        },
+    };
+    invoice
+        .update_signature(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
+        .unwrap();
+
+    CchOrder {
+        created_at: 1000,
+        expiry_delta_seconds: 3600,
+        wrapped_btc_type_script: ckb_jsonrpc_types::Script {
+            code_hash: Default::default(),
+            hash_type: ckb_jsonrpc_types::ScriptHashType::Data,
+            args: Default::default(),
+        },
+        outgoing_pay_req: "lnbc1...".to_string(),
+        incoming_invoice: CchInvoice::Fiber(invoice),
+        payment_hash,
+        payment_preimage: None,
+        amount_sats: 100000,
+        fee_sats: 100,
+        status,
+        failure_reason: None,
+    }
+}
+
+// =============================================================================
+// on_entering tests
+// =============================================================================
+
+#[test]
+fn test_on_entering_pending_returns_track_incoming_invoice() {
+    let order = create_order_with_fiber_invoice(CchOrderStatus::Pending);
+    let actions = ActionDispatcher::on_entering(&order);
+    assert_eq!(actions, vec![CchOrderAction::TrackIncomingInvoice]);
+}
+
+#[test]
+fn test_on_entering_incoming_accepted_returns_send_and_track_payment() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::IncomingAccepted);
+    let actions = ActionDispatcher::on_entering(&order);
+    assert_eq!(
+        actions,
+        vec![
+            CchOrderAction::SendOutgoingPayment,
+            CchOrderAction::TrackOutgoingPayment,
+        ]
+    );
+}
+
+#[test]
+fn test_on_entering_outgoing_in_flight_returns_track_payment() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::OutgoingInFlight);
+    let actions = ActionDispatcher::on_entering(&order);
+    assert_eq!(actions, vec![CchOrderAction::TrackOutgoingPayment]);
+}
+
+#[test]
+fn test_on_entering_outgoing_succeeded_returns_settle_invoice() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::OutgoingSuccess);
+    let actions = ActionDispatcher::on_entering(&order);
+    assert_eq!(actions, vec![CchOrderAction::SettleIncomingInvoice]);
+}
+
+#[test]
+fn test_on_entering_success_returns_empty() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Success);
+    let actions = ActionDispatcher::on_entering(&order);
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn test_on_entering_failed_returns_cancel_invoice() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Failed);
+    let actions = ActionDispatcher::on_entering(&order);
+    assert_eq!(actions, vec![CchOrderAction::CancelIncomingInvoice]);
+}
+
+#[test]
+fn test_on_entering_failed_with_preimage_does_not_cancel_invoice() {
+    let mut order = create_order_with_lightning_invoice(CchOrderStatus::Failed);
+    order.payment_preimage = Some(test_payment_hash(42));
+
+    let actions = ActionDispatcher::on_entering(&order);
+
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn test_cancel_incoming_invoice_requires_failed_without_preimage() {
+    let failed_without_preimage = create_order_with_lightning_invoice(CchOrderStatus::Failed);
+    assert!(CancelIncomingInvoiceDispatcher::should_dispatch(
+        &failed_without_preimage
+    ));
+
+    let mut failed_with_preimage = create_order_with_lightning_invoice(CchOrderStatus::Failed);
+    failed_with_preimage.payment_preimage = Some(test_payment_hash(42));
+    assert!(!CancelIncomingInvoiceDispatcher::should_dispatch(
+        &failed_with_preimage
+    ));
+
+    let pending = create_order_with_lightning_invoice(CchOrderStatus::Pending);
+    assert!(!CancelIncomingInvoiceDispatcher::should_dispatch(&pending));
+}
+
+// =============================================================================
+// dispatch_invoice_handler tests
+// =============================================================================
+
+#[test]
+fn test_dispatch_invoice_handler_returns_fiber_for_fiber_invoice() {
+    let order = create_order_with_fiber_invoice(CchOrderStatus::Pending);
+    let handler = dispatch_invoice_handler(&order);
+    assert_eq!(handler, InvoiceHandlerType::Fiber);
+}
+
+#[test]
+fn test_dispatch_invoice_handler_returns_lightning_for_lightning_invoice() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Pending);
+    let handler = dispatch_invoice_handler(&order);
+    assert_eq!(handler, InvoiceHandlerType::Lightning);
+}
+
+// =============================================================================
+// dispatch_payment_handler tests
+// =============================================================================
+
+#[test]
+fn test_dispatch_payment_handler_returns_lightning_for_fiber_invoice() {
+    // When incoming is Fiber, outgoing payment goes to Lightning
+    let order = create_order_with_fiber_invoice(CchOrderStatus::Pending);
+    let handler = dispatch_payment_handler(&order);
+    assert_eq!(handler, PaymentHandlerType::Lightning);
+}
+
+#[test]
+fn test_dispatch_payment_handler_returns_fiber_for_lightning_invoice() {
+    // When incoming is Lightning, outgoing payment goes to Fiber
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Pending);
+    let handler = dispatch_payment_handler(&order);
+    assert_eq!(handler, PaymentHandlerType::Fiber);
+}
+
+// =============================================================================
+// SendOutgoingPaymentDispatcher::should_dispatch tests
+// =============================================================================
+
+#[test]
+fn test_send_outgoing_payment_should_dispatch_when_incoming_accepted() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::IncomingAccepted);
+    assert!(SendOutgoingPaymentDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_send_outgoing_payment_should_not_dispatch_when_pending() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Pending);
+    assert!(!SendOutgoingPaymentDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_send_outgoing_payment_should_not_dispatch_when_outgoing_in_flight() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::OutgoingInFlight);
+    assert!(!SendOutgoingPaymentDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_send_outgoing_payment_should_not_dispatch_when_success() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Success);
+    assert!(!SendOutgoingPaymentDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_send_outgoing_payment_should_not_dispatch_when_failed() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Failed);
+    assert!(!SendOutgoingPaymentDispatcher::should_dispatch(&order));
+}
+
+// =============================================================================
+// SettleIncomingInvoiceDispatcher::should_dispatch tests
+// =============================================================================
+
+#[test]
+fn test_settle_incoming_invoice_should_dispatch_when_outgoing_succeeded() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::OutgoingSuccess);
+    assert!(SettleIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_settle_incoming_invoice_should_not_dispatch_when_pending() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Pending);
+    assert!(!SettleIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_settle_incoming_invoice_should_not_dispatch_when_outgoing_in_flight() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::OutgoingInFlight);
+    assert!(!SettleIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_settle_incoming_invoice_should_not_dispatch_when_success() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Success);
+    assert!(!SettleIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+// =============================================================================
+// TrackIncomingInvoiceDispatcher::should_dispatch tests
+// =============================================================================
+
+#[test]
+fn test_track_incoming_invoice_should_dispatch_when_pending() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Pending);
+    assert!(TrackIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_track_incoming_invoice_should_dispatch_when_incoming_accepted() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::IncomingAccepted);
+    assert!(TrackIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_track_incoming_invoice_should_dispatch_when_outgoing_in_flight() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::OutgoingInFlight);
+    assert!(TrackIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_track_incoming_invoice_should_dispatch_when_outgoing_succeeded() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::OutgoingSuccess);
+    assert!(TrackIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_track_incoming_invoice_should_not_dispatch_when_success() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Success);
+    assert!(!TrackIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_track_incoming_invoice_should_not_dispatch_when_failed() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Failed);
+    assert!(!TrackIncomingInvoiceDispatcher::should_dispatch(&order));
+}
+
+// =============================================================================
+// TrackOutgoingPaymentDispatcher::should_dispatch tests
+// =============================================================================
+
+#[test]
+fn test_track_outgoing_payment_dispatches_for_lightning_payment() {
+    let order = create_order_with_fiber_invoice(CchOrderStatus::OutgoingInFlight);
+    assert!(TrackOutgoingPaymentDispatcher::should_dispatch(&order));
+}
+
+#[test]
+fn test_track_outgoing_payment_dispatches_for_fiber_payment() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::OutgoingInFlight);
+    assert!(TrackOutgoingPaymentDispatcher::should_dispatch(&order));
+}
+
+// =============================================================================
+// Handler type consistency tests
+// =============================================================================
+
+#[test]
+fn test_invoice_and_payment_handlers_are_inverse_for_fiber() {
+    let order = create_order_with_fiber_invoice(CchOrderStatus::Pending);
+    let invoice_handler = dispatch_invoice_handler(&order);
+    let payment_handler = dispatch_payment_handler(&order);
+
+    assert_eq!(invoice_handler, InvoiceHandlerType::Fiber);
+    assert_eq!(payment_handler, PaymentHandlerType::Lightning);
+}
+
+#[test]
+fn test_invoice_and_payment_handlers_are_inverse_for_lightning() {
+    let order = create_order_with_lightning_invoice(CchOrderStatus::Pending);
+    let invoice_handler = dispatch_invoice_handler(&order);
+    let payment_handler = dispatch_payment_handler(&order);
+
+    assert_eq!(invoice_handler, InvoiceHandlerType::Lightning);
+    assert_eq!(payment_handler, PaymentHandlerType::Fiber);
+}
+
+// =============================================================================
+// outgoing_fee_budget_sats tests
+// =============================================================================
+
+#[test]
+fn test_outgoing_fee_budget_full_percentage_uses_entire_fee() {
+    let mut order = create_order_with_lightning_invoice(CchOrderStatus::IncomingAccepted);
+    order.fee_sats = 1_000;
+    assert_eq!(
+        crate::cch::actions::send_outgoing_payment::outgoing_fee_budget_sats(&order, 100),
+        1_000
+    );
+}
+
+#[test]
+fn test_outgoing_fee_budget_scales_with_percentage() {
+    let mut order = create_order_with_lightning_invoice(CchOrderStatus::IncomingAccepted);
+    order.fee_sats = 1_000;
+    assert_eq!(
+        crate::cch::actions::send_outgoing_payment::outgoing_fee_budget_sats(&order, 50),
+        500
+    );
+    assert_eq!(
+        crate::cch::actions::send_outgoing_payment::outgoing_fee_budget_sats(&order, 1),
+        10
+    );
+}
+
+#[test]
+fn test_outgoing_fee_budget_rounds_down() {
+    let mut order = create_order_with_lightning_invoice(CchOrderStatus::IncomingAccepted);
+    order.fee_sats = 99;
+    // 99 * 50 / 100 = 49.5 -> 49 (integer division floors, never exceeding the collected fee)
+    assert_eq!(
+        crate::cch::actions::send_outgoing_payment::outgoing_fee_budget_sats(&order, 50),
+        49
+    );
+}
+
+#[test]
+fn test_outgoing_fee_budget_never_exceeds_collected_fee() {
+    let mut order = create_order_with_lightning_invoice(CchOrderStatus::IncomingAccepted);
+    for fee_sats in [0u128, 1, 7, 1_000, u128::from(u64::MAX)] {
+        order.fee_sats = fee_sats;
+        for pct in 1..=100u64 {
+            let budget =
+                crate::cch::actions::send_outgoing_payment::outgoing_fee_budget_sats(&order, pct);
+            assert!(
+                budget <= fee_sats,
+                "budget {} must never exceed collected fee {} (pct {})",
+                budget,
+                fee_sats,
+                pct
+            );
+        }
+    }
+}
+
+// =============================================================================
+// outgoing_max_fee_rate tests
+// =============================================================================
+
+#[test]
+fn test_outgoing_max_fee_rate_zero_amount_is_zero() {
+    assert_eq!(
+        crate::cch::actions::send_outgoing_payment::outgoing_max_fee_rate(0, 100),
+        0
+    );
+}
+
+#[test]
+fn test_outgoing_max_fee_rate_rounds_up() {
+    // ceil(5 * 1000 / 1000) = 5
+    assert_eq!(
+        crate::cch::actions::send_outgoing_payment::outgoing_max_fee_rate(1_000, 5),
+        5
+    );
+    // ceil(1 * 1000 / 1000) = 1 (would floor to 0, rounding up keeps the budget reachable)
+    assert_eq!(
+        crate::cch::actions::send_outgoing_payment::outgoing_max_fee_rate(1_000, 1),
+        1
+    );
+}
+
+#[test]
+fn test_outgoing_max_fee_rate_cap_covers_budget() {
+    // The rate-derived cap, ceil(amount * rate / 1000), must always be >= the fee budget so the
+    // CCH budget (not the default rate) is the binding constraint.
+    const DENOM: u128 = 1000;
+    for amount in [1u128, 7, 1_000, 21_000, 1_000_000] {
+        for max_fee_amount in [0u128, 1, 5, 50, 999, amount] {
+            let rate = crate::cch::actions::send_outgoing_payment::outgoing_max_fee_rate(
+                amount,
+                max_fee_amount,
+            );
+            let cap = (amount * rate as u128).div_ceil(DENOM);
+            assert!(
+                cap >= max_fee_amount,
+                "rate-derived cap {} must cover budget {} (amount {}, rate {})",
+                cap,
+                max_fee_amount,
+                amount,
+                rate
+            );
+        }
+    }
+}
+
+// =============================================================================
+// CchConfig::validate tests
+// =============================================================================
+
+#[test]
+fn test_config_validate_accepts_boundaries() {
+    use crate::cch::CchConfig;
+    let mut config = CchConfig {
+        max_outgoing_fee_percentage: 1,
+        ..Default::default()
+    };
+    assert!(config.validate().is_ok());
+    config.max_outgoing_fee_percentage = 100;
+    assert!(config.validate().is_ok());
+    config.max_outgoing_fee_percentage = 50;
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_config_validate_rejects_out_of_range() {
+    use crate::cch::CchConfig;
+    let mut config = CchConfig {
+        max_outgoing_fee_percentage: 0,
+        ..Default::default()
+    };
+    assert!(config.validate().is_err());
+    config.max_outgoing_fee_percentage = 101;
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn test_config_default_percentage_reserves_operator_margin() {
+    use crate::cch::{config::DEFAULT_MAX_OUTGOING_FEE_PERCENTAGE, CchConfig};
+
+    let config = CchConfig::default();
+    assert_eq!(
+        config.max_outgoing_fee_percentage,
+        DEFAULT_MAX_OUTGOING_FEE_PERCENTAGE
+    );
+    assert!(config.max_outgoing_fee_percentage < 100);
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_default_cch_fee_budget_covers_a_default_fiber_intermediate_hop() {
+    use crate::cch::{
+        actions::send_outgoing_payment::outgoing_fee_budget_from_fee_sats, CchConfig,
+    };
+    use crate::fiber::config::DEFAULT_TLC_FEE_PROPORTIONAL_MILLIONTHS;
+
+    const ORDER_AMOUNT_SATS: u128 = 1_000_000;
+    let config = CchConfig::default();
+    let collected_fee_sats =
+        ORDER_AMOUNT_SATS.saturating_mul(config.fee_rate_per_million_sats as u128) / 1_000_000
+            + config.base_fee_sats as u128;
+    let outgoing_budget_sats =
+        outgoing_fee_budget_from_fee_sats(collected_fee_sats, config.max_outgoing_fee_percentage);
+    let one_hop_fee_sats =
+        ORDER_AMOUNT_SATS.saturating_mul(DEFAULT_TLC_FEE_PROPORTIONAL_MILLIONTHS) / 1_000_000;
+
+    assert!(
+        outgoing_budget_sats >= one_hop_fee_sats,
+        "default CCH outgoing budget {outgoing_budget_sats} sats must cover one default Fiber intermediate-hop fee of {one_hop_fee_sats} sats"
+    );
+}

@@ -1,0 +1,502 @@
+on: [push, pull_request]
+
+name: Continuous integration
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  changes:
+    name: Detect channel_restart_stress Changes
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      channel_restart_stress: ${{ steps.filter.outputs.channel_restart_stress }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            channel_restart_stress:
+              - '.github/workflows/ci.yml'
+              - '.config/nextest.toml'
+              - 'crates/fiber-lib/src/fiber/channel.rs'
+              - 'crates/fiber-lib/src/fiber/network.rs'
+              - 'crates/fiber-lib/src/fiber/payment.rs'
+              - 'crates/fiber-lib/src/fiber/tests/channel_restart_stress.rs'
+              - 'crates/fiber-lib/src/fiber/tests/utils.rs'
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-${{ runner.os }}
+      - run: |
+          make check
+          make check-migrate
+          make check-dirty-rpc-doc
+
+  cargo-shear:
+    name: Cargo Shear
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: shear-${{ runner.os }}
+      - uses: cargo-bins/cargo-binstall@main
+      - run: |
+          cargo binstall --no-confirm cargo-shear --force --locked --version 1.1.9
+          cargo shear
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ runner.os }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Run tests
+        run: |
+          RUST_BACKTRACE=full RUST_LOG=trace,fnn=trace,fnn::cch::actor::tracker=off,fnn::fiber::gossip=off,tentacle=off,tokio_yamux=off,tentacle_secio=off cargo nextest run --no-fail-fast
+        env:
+          RUST_TEST_THREADS: 2
+      - name: Run tests (sqlite)
+        run: |
+          RUST_BACKTRACE=full RUST_LOG=trace,fnn=trace,fnn::cch::actor::tracker=off,fnn::fiber::gossip=off,tentacle=off,tokio_yamux=off,tentacle_secio=off cargo nextest run --no-fail-fast --no-default-features --features sqlite
+        env:
+          RUST_TEST_THREADS: 2
+
+  channel_restart_stress:
+    name: channel_restart_stress
+    needs: [changes]
+    if: needs.changes.outputs.channel_restart_stress == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: channel-restart-stress-${{ runner.os }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Run channel_restart_stress tests
+        run: |
+          RUST_BACKTRACE=full RUST_LOG=trace,fnn=trace,fnn::cch::actor::tracker=off,fnn::fiber::gossip=off,tentacle=off,tokio_yamux=off,tentacle_secio=off cargo nextest run -p fnn --lib --features rocksdb --run-ignored only --no-fail-fast -j 1 -- fiber::tests::channel_restart_stress::test_node_restart --exact
+        env:
+          RUST_TEST_THREADS: 2
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fmt-${{ runner.os }}
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ runner.os }}
+      - run: |
+          rustup target add wasm32-unknown-unknown
+          make clippy
+
+  typos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check for typos
+        uses: crate-ci/typos@v1.39.0
+      - name: Typos info
+        if: failure()
+        run: |
+          echo 'To fix typos, please run `cargo install typos && typos -w`'
+          echo 'To check for a diff, run `typos`'
+          echo 'You can find typos here: https://crates.io/crates/typos'
+          echo 'if you use VSCode, you can also install `Typos Spell Checker'
+          echo 'You can find the extension here: https://marketplace.visualstudio.com/items?itemName=tekumara.typos-vscode'
+
+  coverage:
+    name: Code Coverage
+    needs: [test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage-${{ runner.os }}
+      - name: Install Grcov
+        run: make coverage-install-tools
+      - name: Generate Code Coverage Report of Unit Tests
+        run: |
+          make coverage-run-unittests
+          make coverage-collect-data
+      - name: Upload Code Coverage Report of Unit Tests
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage-report.info
+          env_vars: OS,RUST_TOOLCHAIN
+          fail_ci_if_error: false
+          flags: unittests
+          verbose: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    name: Build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        profile: [dev, release]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-${{ matrix.os }}-${{ matrix.profile }}
+      - name: Install Dependencies (Windows)
+        if: contains(matrix.os, 'windows')
+        run: |
+          vcpkg integrate install
+          vcpkg install openssl:x64-windows-static
+      - name: Build with profile
+        env:
+          RUSTFLAGS: ${{ contains(matrix.os, 'windows') && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --locked --verbose --profile ${{ matrix.profile }}
+      - name: Smoke test Windows store open
+        if: contains(matrix.os, 'windows')
+        run: |
+          $profileDir = if ("${{ matrix.profile }}" -eq "release") { "release" } else { "debug" }
+          & .github/actions/build-release-package/helpers/smoke-test-windows-store.ps1 -Executable "target\$profileDir\fnn.exe" -Name "fnn-smoke-${{ matrix.profile }}"
+
+  windows-release-test:
+    name: Windows release package test
+    runs-on: windows-2022
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.body || '', '#windows-release-test')
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release-test-${{ runner.os }}
+      - name: Build Windows release package
+        id: package
+        uses: ./.github/actions/build-release-package
+        with:
+          os: windows-2022
+          package-name: fnn_pr${{ github.event.pull_request.number }}_x86_64-windows.tar.gz
+          bin-suffix: .exe
+          windows-dependencies: minimal
+      - name: Upload Windows release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnn-pr${{ github.event.pull_request.number }}-x86_64-windows
+          path: ${{ steps.package.outputs.package_name }}
+
+  linux-release-test:
+    name: Linux release package test (${{ matrix.pkg_suffix }})
+    runs-on: ${{ matrix.os }}
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.body || '', '#linux-release-test')
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            pkg_suffix: x86_64-linux-portable
+            bin_suffix: ''
+            portable: true
+            openssl_configure: linux-x86_64 shared
+          - os: ubuntu-24.04
+            pkg_suffix: x86_64-linux
+            bin_suffix: ''
+            portable: false
+            openssl_configure: ''
+          - os: ubuntu-22.04-arm
+            pkg_suffix: aarch64-linux-portable
+            bin_suffix: ''
+            portable: true
+            openssl_configure: linux-aarch64 shared
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-release-test-${{ matrix.pkg_suffix }}
+      - name: Build Linux release package
+        id: package
+        uses: ./.github/actions/build-release-package
+        with:
+          os: ${{ matrix.os }}
+          package-name: fnn_pr${{ github.event.pull_request.number }}-${{ matrix.pkg_suffix }}.tar.gz
+          bin-suffix: ${{ matrix.bin_suffix }}
+          portable: ${{ matrix.portable }}
+          openssl-configure: ${{ matrix.openssl_configure }}
+      - name: Upload Linux release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnn-pr${{ github.event.pull_request.number }}-${{ matrix.pkg_suffix }}
+          path: ${{ steps.package.outputs.package_name }}
+
+  macos-release-test:
+    name: macOS release package test (${{ matrix.pkg_suffix }})
+    runs-on: ${{ matrix.os }}
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.body || '', '#macos-release-test')
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            pkg_suffix: aarch64-darwin-portable
+            bin_suffix: ''
+            portable: true
+            openssl_configure: ''
+          - os: macos-15-intel
+            pkg_suffix: x86_64-darwin-portable
+            bin_suffix: ''
+            portable: true
+            openssl_configure: ''
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-release-test-${{ matrix.pkg_suffix }}
+      - name: Build macOS release package
+        id: package
+        uses: ./.github/actions/build-release-package
+        with:
+          os: ${{ matrix.os }}
+          package-name: fnn_pr${{ github.event.pull_request.number }}-${{ matrix.pkg_suffix }}.tar.gz
+          bin-suffix: ${{ matrix.bin_suffix }}
+          portable: ${{ matrix.portable }}
+          openssl-configure: ${{ matrix.openssl_configure }}
+      - name: Upload macOS release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnn-pr${{ github.event.pull_request.number }}-${{ matrix.pkg_suffix }}
+          path: ${{ steps.package.outputs.package_name }}
+
+  benchmark:
+    name: Benchmark (Non-Gossip)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Setup Dependencies
+        uses: ./.github/actions/setup-dependencies
+        with:
+          ckb-version: '0.202.0'
+          cache-prefix: 'benchmark'
+
+      - name: Cache build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ./tests/deploy/udt-init/target
+            ./tests/perf/target
+          key: build-artifacts-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            build-artifacts-${{ runner.os }}-
+
+      - name: Build rust code
+        run: |
+          cd ./tests/deploy/udt-init && cargo build --locked && cd -
+          cd ./tests/perf/ && cargo build --release --locked && cd -
+
+      - name: Run baseline benchmark
+        run: |
+          echo "Comparing against: origin/${{ github.base_ref }}"
+          git checkout origin/${{ github.base_ref }}
+
+          export ON_GITHUB_ACTION=y
+          CKB_LOG=warn TEST_ENV=release ./tests/nodes/start.sh > baseline.log 2>&1 &
+          ./tests/nodes/wait.sh
+
+          cd ./tests/perf/
+          cargo run --bin run-test --release integration
+          cargo run --bin run-test --release benchmark 90 30 base
+          cd -
+          mkdir -p ./tests/perf/artifacts
+          if [ -f "./tests/perf/baseline.json" ] && [ ! -f "./tests/perf/artifacts/baseline.json" ]; then
+            mv ./tests/perf/baseline.json ./tests/perf/artifacts/baseline.json
+          fi
+          git stash
+
+      - name: Run current benchmark
+        run: |
+          echo "Running benchmark on current PR commit: ${{ github.sha }}"
+          git checkout ${{ github.sha }}
+
+          pkill -f 'fnn|ckb run|npm' || true
+          rm -rf ./tests/nodes/.ports
+          export ON_GITHUB_ACTION=y
+          REMOVE_OLD_STATE=y CKB_LOG=warn TEST_ENV=release ./tests/nodes/start.sh > current.log 2>&1 &
+          ./tests/nodes/wait.sh
+
+          cd ./tests/perf/
+          cargo run --bin run-test --release integration
+          cargo run --bin run-test --release benchmark 90 30 compare
+          cd -
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            ./baseline.log
+            ./current.log
+            ./tests/perf/artifacts/comparison_report.txt
+            ./tests/perf/artifacts/baseline.json
+            ./tests/perf/artifacts/current.json
+
+      - name: Check benchmark result
+        run: |
+          echo "Check benchmark result on current PR commit: ${{ github.sha }}"
+          if [ -f "./tests/perf/artifacts/comparison_report.txt" ]; then
+            if grep -q "Performance regression detected" "./tests/perf/artifacts/comparison_report.txt"; then
+              echo "❌ Performance regression detected! Failing the workflow."
+              exit 1
+            else
+              echo "✅ No performance regression detected."
+            fi
+          else
+            echo "⚠️ Comparison report not found at ./tests/perf/artifacts/comparison_report.txt"
+            echo "This might indicate a benchmark execution failure."
+            exit 1
+          fi
+
+  payment-benchmark:
+    name: Payment Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: false # temporarily disabled
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dsherret/rust-toolchain-file@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: payment-bench-${{ runner.os }}
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Run payment benchmarks baseline
+        run: |
+          echo "Running payment benchmarks baseline: origin/${{ github.base_ref }}"
+          git checkout origin/${{ github.base_ref }}
+          cargo bench -p fnn --features bench --bench payment_benchmarks -- find_path_200n_2000c --save-baseline base
+          rm -rf /tmp/criterion-baseline
+          mkdir -p /tmp/criterion-baseline
+          cp -R target/criterion /tmp/criterion-baseline
+
+      - name: Run payment benchmarks current
+        run: |
+          echo "Running payment benchmarks on current PR commit: ${{ github.sha }}"
+          git checkout ${{ github.sha }}
+          cargo bench -p fnn --features bench --bench payment_benchmarks
+          rm -rf /tmp/criterion-current
+          mkdir -p /tmp/criterion-current
+          cp -R target/criterion /tmp/criterion-current
+
+      - name: Check payment benchmark regression
+        run: |
+          set -euo pipefail
+          base_dir=/tmp/criterion-baseline
+          cur_dir=/tmp/criterion-current
+          max_reg=0
+          worst_case=""
+          while IFS= read -r base; do
+            rel=${base#"$base_dir"/}
+            cur=${rel%/base/estimates.json}/new/estimates.json
+            cur="$cur_dir/$cur"
+            if [[ ! -f "$cur" ]]; then
+              echo "Missing current estimate for $rel"
+              exit 1
+            fi
+            base_mean=$(jq -r '.mean.point_estimate' "$base")
+            cur_mean=$(jq -r '.mean.point_estimate' "$cur")
+            if [[ "$base_mean" == "0" ]]; then
+              continue
+            fi
+            reg=$(awk -v b="$base_mean" -v c="$cur_mean" 'BEGIN { printf "%.6f", ((c-b)/b)*100 }')
+            dir="flat"
+            if awk -v r="$reg" 'BEGIN { exit !(r > 0.5) }'; then
+              dir="down"
+            elif awk -v r="$reg" 'BEGIN { exit !(r < -0.5) }'; then
+              dir="up"
+            fi
+            if [[ "$dir" == "down" ]]; then
+              emoji="🔻"
+            elif [[ "$dir" == "up" ]]; then
+              emoji="👍"
+            else
+              emoji="🟰"
+            fi
+            echo "$emoji Result: $rel baseline=$base_mean current=$cur_mean change=${reg}% ($dir)"
+            if awk -v r="$reg" 'BEGIN { exit !(r > 5.0) }'; then
+              echo "🚨 Regression > 5%: $rel (baseline=$base_mean current=$cur_mean, ${reg}% )"
+              if awk -v r="$reg" -v m="$max_reg" 'BEGIN { exit !(r > m) }'; then
+                max_reg=$reg
+                worst_case=$rel
+              fi
+            fi
+          done < <(find "$base_dir" -path "*/base/estimates.json" -type f | sort)
+
+          if awk -v m="$max_reg" 'BEGIN { exit !(m > 5.0) }'; then
+            echo "❌ Payment benchmark regression detected: $worst_case (${max_reg}%)"
+            exit 1
+          fi
+          echo "✅ Payment benchmark regression within 5% threshold"
+
+      - name: Upload payment benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: payment-benchmark-results
+          path: |
+            /tmp/criterion-baseline
+            /tmp/criterion-current
