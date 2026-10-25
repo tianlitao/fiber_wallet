@@ -50,7 +50,7 @@ pub fn App() -> impl IntoElement {
 
     let cx = Cx {
         config: signal(shared::config::get().clone()),
-        nav: signal(Nav::Discover), // TEMP-VERIFY: dApp host on iOS
+        nav: signal(Nav::Trade), // TEMP-VERIFY: trade page on iOS
         trade_tab: signal(0_usize),
         ui: signal(bridge::WalletBridge::global().state()),
         invoice_history: signal(Vec::new()),
@@ -69,7 +69,7 @@ pub fn App() -> impl IntoElement {
         channel_address: signal(String::new()),
         channel_amount: signal(String::new()),
         channel_public: signal(true),
-        dapp_open: signal(Some("builtin:protocol-selftest".to_owned())), // TEMP-VERIFY
+        dapp_open: signal(None),
         dapp_navigation: signal(None),
         dapp_loading: signal(false),
         dapp_error: signal(None),

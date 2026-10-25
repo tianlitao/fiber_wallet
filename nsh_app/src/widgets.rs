@@ -188,12 +188,13 @@ pub fn right_status(cx: Cx) -> View {
                     matches!(phase, Some(NodePhase::Starting) | Some(NodePhase::Stopping)),
                     |dot| dot.animate_spin(),
                 ))
-                .child(
-                    text(format!("{label} · 测试网"))
+                .child({
+                    let network = cx.config.get().network;
+                    text(format!("{label} · {}", network.label()))
                         .text_size(px(ts::XS))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(colors.fg),
-                ),
+                        .text_color(colors.fg)
+                }),
         )
     }))
 }

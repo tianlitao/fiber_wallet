@@ -25,7 +25,8 @@ Icon sidebar with four pages:
   `window.fiberWallet` (`src/dapp_host.rs`, `dapp_protocol.rs`,
   `dapp_registry.rs`); writes require default-deny approval dialogs.
 - **设置** — theme mode (跟随系统/浅色/深色), accent color (CKB 薄荷 / Fiber 青
-  / 极光蓝 / 星紫 / 琥珀), HTTP(S) proxy, node info, keystore password
+  / 极光蓝 / 星紫 / 琥珀), network (测试网/主网 selector — mainnet shown but
+  not selectable yet), HTTP(S) proxy, node info, keystore password
   rotation, backup export/import, about.
 
 ## Theming

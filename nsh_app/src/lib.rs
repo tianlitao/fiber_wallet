@@ -224,7 +224,7 @@ fn sidebar(cx: Cx) -> View {
         .child(view().flex_1())
         .child(
             view().gap_1().px_2().py_3().child(node_line(cx)).child(
-                text("CKB Fiber 测试网")
+                text(move || format!("CKB Fiber {}", cx.config.get().network.label()))
                     .text_size(px(ts::XS))
                     .text_color(move || pal_fn(&cx).fg_muted),
             ),

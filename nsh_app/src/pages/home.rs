@@ -62,11 +62,14 @@ fn hero_balance(cx: Cx) -> View {
                         .text_color(move || pal_fn(&cx).fg_muted),
                 ),
         )
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap_5()
+        .child({
+            // Desktop: balance left, QR right. A phone stacks them: at phone
+            // width the hero number would wrap mid-digit beside the 104 pt QR.
+            #[cfg(target_os = "ios")]
+            let metrics = view().gap_5();
+            #[cfg(not(target_os = "ios"))]
+            let metrics = view().flex_row().items_center().gap_5();
+            metrics
                 // Texts refresh with the wallet state…
                 .child(dynamic(move || {
                     let state = cx.ui_state();
@@ -79,7 +82,7 @@ fn hero_balance(cx: Cx) -> View {
                             info.channel_balance_shannons.clone(),
                         ])
                     });
-                    let mut hero = view().flex_1().min_w(px(0.0)).gap_1().child(
+                    let mut hero = view().gap_1().min_w(px(0.0)).child(
                         text(match &total {
                             Some(shannons) => {
                                 format!("{} CKB", theme::ckb_display(shannons))
@@ -91,6 +94,11 @@ fn hero_balance(cx: Cx) -> View {
                         .font_family(theme::mono_family)
                         .text_color(colors.fg),
                     );
+                    if !cfg!(target_os = "ios") {
+                        // Only the desktop row needs the grow; in a stacked
+                        // column it would be meaningless.
+                        hero = hero.flex_1();
+                    }
                     hero = hero.child(
                         view().flex_row().items_center().gap_2().child(
                             text(match state.node_info.as_ref() {
@@ -144,8 +152,8 @@ fn hero_balance(cx: Cx) -> View {
                                     .text_color(move || pal_fn(&cx).fg_muted),
                             )
                     },
-                )),
-        )
+                ))
+        })
 }
 
 fn stat_card(cx: Cx, label: &'static str, value: impl Fn() -> String + 'static) -> View {
@@ -253,101 +261,100 @@ fn quick_actions(cx: Cx) -> View {
 }
 
 fn activity_row(cx: Cx) -> View {
-    view()
-        .flex_row()
-        .items_start()
-        .gap_4()
-        .child(
-            // flex_1 (`1 1 0`) on both cards: they share the row exactly and
-            // their texts wrap — flex_grow alone never shrinks, and long
-            // content pushed the row past the window edge.
-            card(cx)
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .p_5()
-                .gap_3()
-                .child(section_label(cx, "最近支付"))
-                .child(dynamic(move || {
-                    let state = cx.ui_state();
-                    if state.payments.is_empty() {
-                        Some(
-                            view().py_3().child(
-                                text(
-                                    if state.snapshot.map(|s| s.phase) == Some(NodePhase::Running) {
-                                        "暂无支付记录。"
-                                    } else {
-                                        "节点离线，启动后显示。"
-                                    },
-                                )
-                                .text_size(px(ts::SM))
-                                .text_color(move || pal_fn(&cx).fg_muted),
-                            ),
+    // Desktop: the two cards share one row. A phone stacks them — two
+    // half-width cards squeeze the log console (and its monospace lines)
+    // past the screen edge.
+    #[cfg(target_os = "ios")]
+    let row = view().gap_4();
+    #[cfg(not(target_os = "ios"))]
+    let row = view().flex_row().items_start().gap_4();
+    row.child(recent_payments_card(cx)).child(node_log_card(cx))
+}
+
+fn recent_payments_card(cx: Cx) -> View {
+    let card = card(cx).overflow_hidden().p_5().gap_3();
+    #[cfg(not(target_os = "ios"))]
+    // flex_1 (`1 1 0`) shares the desktop row exactly; long content pushed
+    // the row past the window edge, and flex_grow alone never shrinks.
+    let card = card.flex_1().min_w(px(0.0));
+    card.child(section_label(cx, "最近支付"))
+        .child(dynamic(move || {
+            let state = cx.ui_state();
+            if state.payments.is_empty() {
+                Some(
+                    view().py_3().child(
+                        text(
+                            if state.snapshot.map(|s| s.phase) == Some(NodePhase::Running) {
+                                "暂无支付记录。"
+                            } else {
+                                "节点离线，启动后显示。"
+                            },
                         )
-                    } else {
-                        Some(
-                            view().gap_2().children(
-                                state
-                                    .payments
-                                    .iter()
-                                    .take(5)
-                                    .map(|payment| crate::pages::trade::payment_row(cx, payment)),
-                            ),
+                        .text_size(px(ts::SM))
+                        .text_color(move || pal_fn(&cx).fg_muted),
+                    ),
+                )
+            } else {
+                Some(
+                    view().gap_2().children(
+                        state
+                            .payments
+                            .iter()
+                            .take(5)
+                            .map(|payment| crate::pages::trade::payment_row(cx, payment)),
+                    ),
+                )
+            }
+        }))
+}
+
+fn node_log_card(cx: Cx) -> View {
+    let card = card(cx).overflow_hidden().p_5().gap_3();
+    #[cfg(not(target_os = "ios"))]
+    let card = card.flex_1().min_w(px(0.0));
+    card.child(section_label(cx, "节点事件 · 实时日志"))
+        .child(dynamic(move || {
+            let state = cx.ui_state();
+            // The native binary installs a log capture layer; until
+            // its first lines arrive (or on hosts without it) fall
+            // back to the phase-transition events.
+            let mut lines: Vec<String> = if state.log_tail.is_empty() {
+                state.events.iter().take(6).cloned().collect()
+            } else {
+                let start = state.log_tail.len().saturating_sub(9);
+                state.log_tail[start..].to_vec()
+            };
+            // Newest first: new lines always appear at the top of the
+            // card instead of pushing the view down.
+            lines.reverse();
+            Some(
+                view()
+                    .gap_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .p_3()
+                    .rounded(px(8.0))
+                    .bg(move || pal_fn(&cx).bg)
+                    .border_1()
+                    .border_color(move || pal_fn(&cx).border)
+                    .children(lines.into_iter().map(|line| {
+                        let colors = pal_fn(&cx);
+                        let color = if line.contains(" ERROR ") {
+                            colors.danger
+                        } else if line.contains(" WARN ") {
+                            colors.warn
+                        } else {
+                            colors.fg_muted
+                        };
+                        view().child(
+                            text(line)
+                                .text_size(px(ts::XS))
+                                .font_family(theme::mono_family)
+                                .text_color(color),
                         )
-                    }
-                })),
-        )
-        .child(
-            card(cx)
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .p_5()
-                .gap_3()
-                .child(section_label(cx, "节点事件 · 实时日志"))
-                .child(dynamic(move || {
-                    let state = cx.ui_state();
-                    // The native binary installs a log capture layer; until
-                    // its first lines arrive (or on hosts without it) fall
-                    // back to the phase-transition events.
-                    let mut lines: Vec<String> = if state.log_tail.is_empty() {
-                        state.events.iter().take(6).cloned().collect()
-                    } else {
-                        let start = state.log_tail.len().saturating_sub(9);
-                        state.log_tail[start..].to_vec()
-                    };
-                    // Newest first: new lines always appear at the top of the
-                    // card instead of pushing the view down.
-                    lines.reverse();
-                    Some(
-                        view()
-                            .gap_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .p_3()
-                            .rounded(px(8.0))
-                            .bg(move || pal_fn(&cx).bg)
-                            .border_1()
-                            .border_color(move || pal_fn(&cx).border)
-                            .children(lines.into_iter().map(|line| {
-                                let colors = pal_fn(&cx);
-                                let color = if line.contains(" ERROR ") {
-                                    colors.danger
-                                } else if line.contains(" WARN ") {
-                                    colors.warn
-                                } else {
-                                    colors.fg_muted
-                                };
-                                view().child(
-                                    text(line)
-                                        .text_size(px(ts::XS))
-                                        .font_family(theme::mono_family)
-                                        .text_color(color),
-                                )
-                            })),
-                    )
-                })),
-        )
+                    })),
+            )
+        }))
 }
 
 use fiber_wallet_core::api::node::NodePhase;

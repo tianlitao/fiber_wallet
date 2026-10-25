@@ -62,10 +62,35 @@ impl Accent {
     ];
 }
 
+/// The Fiber network the embedded node runs on. Mainnet is shown in the
+/// selector but intentionally not selectable yet: the wallet is testnet-only
+/// today (testnet faucet, testnet-only on-chain transfers).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Network {
+    #[default]
+    Testnet,
+    Mainnet,
+}
+
+impl Network {
+    pub fn label(self) -> &'static str {
+        match self {
+            Network::Testnet => "测试网",
+            Network::Mainnet => "主网",
+        }
+    }
+
+    pub const ALL: [Network; 2] = [Network::Testnet, Network::Mainnet];
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub theme_mode: ThemeMode,
     pub accent: Accent,
+    /// Serialized with a default so configs written before this field existed
+    /// keep parsing (and default to testnet).
+    #[serde(default)]
+    pub network: Network,
     pub proxy_enabled: bool,
     pub proxy_host: String,
     pub proxy_port: u16,

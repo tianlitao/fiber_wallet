@@ -439,6 +439,83 @@ fn ok_text(cx: Cx, message: String) -> View {
     )
 }
 
+/// 网络 selection: 测试网 is the only selectable value today. 主网 is shown
+/// for transparency but not clickable — clicking it explains why.
+fn network_selector(cx: Cx) -> View {
+    view()
+        .gap_1()
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .children(crate::config::Network::ALL.map(|network| network_chip(cx, network))),
+        )
+        .child(
+            text("主网暂未开放：钱包当前仅支持测试网；切换网络需要重启节点并使用独立数据目录。")
+                .text_size(px(ts::XS))
+                .text_color(move || pal_fn(&cx).fg_muted),
+        )
+}
+
+fn network_chip(cx: Cx, network: crate::config::Network) -> View {
+    let selected = move || cx.config.get().network == network;
+    let available = network == crate::config::Network::Testnet;
+    view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .px_3()
+        .py(px(6.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(move || {
+            let colors = pal_fn(&cx);
+            if selected() {
+                colors.accent
+            } else {
+                colors.border
+            }
+        })
+        .bg(move || {
+            let colors = pal_fn(&cx);
+            if selected() {
+                colors.accent_soft
+            } else {
+                colors.card
+            }
+        })
+        .child(
+            text(network.label())
+                .text_size(px(ts::SM))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || {
+                    let colors = pal_fn(&cx);
+                    if selected() {
+                        colors.accent
+                    } else {
+                        colors.fg_muted
+                    }
+                }),
+        )
+        .when(available, |chip| chip.cursor_pointer())
+        .when(!available, |chip| {
+            chip.child(
+                text("未开放")
+                    .text_size(px(ts::XS))
+                    .px_1()
+                    .py(px(1.0))
+                    .rounded(px(4.0))
+                    .bg(move || pal_fn(&cx).card_alt)
+                    .text_color(move || pal_fn(&cx).fg_muted),
+            )
+            .cursor_pointer()
+            .on_press(move || {
+                toast("主网暂未开放，当前仅支持测试网", ToastDuration::Short);
+            })
+        })
+}
+
 fn default_export_path() -> String {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -453,7 +530,7 @@ fn default_export_path() -> String {
 fn node_card(cx: Cx) -> View {
     view().child(
         settings_group(cx, "节点")
-            .child(detail_row(cx, "网络", || "CKB Fiber 测试网".to_owned()))
+            .child(network_selector(cx))
             .child(detail_row(cx, "数据目录", crate::bridge::data_directory))
             .child(
                 outline_button(cx, "在 Finder 中打开", || true, move || {

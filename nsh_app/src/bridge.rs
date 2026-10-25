@@ -332,8 +332,14 @@ impl WalletBridge {
                 .lock()
                 .expect("password poisoned")
                 .clone();
+            // The network comes from the persisted config (设置 → 节点);
+            // the selector only offers testnet today, mainnet is disabled.
+            let network = match crate::config::get().network {
+                crate::config::Network::Testnet => NodeNetwork::Testnet,
+                crate::config::Network::Mainnet => NodeNetwork::Mainnet,
+            };
             let snapshot = node::init_local_node(
-                NodeNetwork::Testnet,
+                network,
                 self.data_dir.to_string_lossy().into_owned(),
                 password,
             );
