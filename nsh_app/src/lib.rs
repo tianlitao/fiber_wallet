@@ -38,9 +38,16 @@ pub fn App() -> impl IntoElement {
     // Headless tests set this: no bridge, no node, no desktop commands —
     // just the shell.
     let test_mode = std::env::var("FIBER_WALLET_TEST").is_ok();
+    // Dev affordance for visual checks: FIBER_WALLET_START_PAGE=trade|discover|settings.
+    let start_page = match std::env::var("FIBER_WALLET_START_PAGE").as_deref() {
+        Ok("trade") => Nav::Trade,
+        Ok("discover") => Nav::Discover,
+        Ok("settings") => Nav::Settings,
+        _ => Nav::Home,
+    };
     let cx = Cx {
         config: signal(config::get().clone()),
-        nav: signal(Nav::Home),
+        nav: signal(start_page),
         trade_tab: signal(0_usize),
         ui: signal(if test_mode {
             bridge::UiState::default()

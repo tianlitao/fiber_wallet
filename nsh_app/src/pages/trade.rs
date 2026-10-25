@@ -594,6 +594,7 @@ fn onchain_view(cx: Cx) -> View {
                     "ckt1…",
                     false,
                 ))
+                .child(scan_button(cx, crate::scan::ScanTarget::OnchainAddress))
                 .child(
                     view()
                         .flex_row()
@@ -1342,6 +1343,36 @@ fn channels_view(cx: Cx) -> View {
         )
 }
 
+/// The FNN channel state as a colored badge: ready = green, closing/settling
+/// = amber, closed = muted, failures = red.
+fn channel_state_chip(cx: Cx, state: &str) -> View {
+    let state = state.to_owned();
+    status_chip(
+        cx,
+        {
+            let state = state.clone();
+            move || state.clone()
+        },
+        move || {
+            let colors = pal_fn(&cx);
+            if state.contains("Failed") || state.contains("Error") {
+                colors.danger
+            } else if state.contains("Closing")
+                || state.contains("Shutdown")
+                || state.contains("Waiting")
+            {
+                colors.warn
+            } else if state == "ChannelReady" {
+                colors.ok
+            } else if state == "Closed" {
+                colors.fg_muted
+            } else {
+                colors.accent
+            }
+        },
+    )
+}
+
 fn close_mode_from_index(index: usize) -> ChannelCloseMode {
     if index == 1 {
         ChannelCloseMode::Force
@@ -1565,16 +1596,24 @@ fn channel_row(
             view()
                 .gap_1()
                 .flex_1()
+                .min_w(px(0.0))
                 .child(
-                    text(format!(
-                        "{} CKB local · {} CKB remote · {}",
-                        shannons_to_ckb(&channel.local_balance),
-                        shannons_to_ckb(&channel.remote_balance),
-                        channel.state
-                    ))
-                    .text_size(px(ts::SM))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(move || pal_fn(&cx).fg),
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            text(format!(
+                                "{} CKB local · {} CKB remote",
+                                shannons_to_ckb(&channel.local_balance),
+                                shannons_to_ckb(&channel.remote_balance),
+                            ))
+                            .text_size(px(ts::SM))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(move || pal_fn(&cx).fg),
+                        )
+                        .child(channel_state_chip(cx, &channel.state)),
                 )
                 .child(
                     text(format!(
@@ -1715,6 +1754,7 @@ fn send_view(cx: Cx) -> View {
                     "fiber invoice 字符串",
                     true,
                 ))
+                .child(scan_button(cx, crate::scan::ScanTarget::Invoice))
                 .child(primary_button(
                     cx,
                     "发送支付",
@@ -1766,48 +1806,80 @@ fn send_view(cx: Cx) -> View {
         )
 }
 
+/// 扫一扫: opens the platform camera scanner and writes the decoded text
+/// into the target input. Renders nothing where no scanner is installed
+/// (desktop hosts), so the shared page keeps its layout.
+fn scan_button(cx: Cx, target: crate::scan::ScanTarget) -> View {
+    if !crate::scan::available() {
+        return view();
+    }
+    let on_result = move |text: String| match target {
+        crate::scan::ScanTarget::Invoice => cx.pay_invoice.set(text),
+        crate::scan::ScanTarget::OnchainAddress => cx.onchain_address.set(text),
+    };
+    outline_button(cx, "扫一扫", crate::scan::available, move || {
+        crate::scan::request(target, std::boxed::Box::new(on_result));
+    })
+}
+
 /// One payment record row, shared with the home page.
 pub fn payment_row(cx: Cx, payment: &WalletPayment) -> View {
     let status = payment.status;
+    let failed_error = payment.failed_error.clone();
+    let hash = theme::short_id(&payment.payment_hash, 10);
+    let fee = payment.fee_shannons.clone();
+    let created = crate::bridge::timestamp(payment.created_at_ms);
+    let updated = crate::bridge::timestamp(payment.last_updated_at_ms);
     view()
         .flex_row()
         .items_start()
         .gap_2()
         .pb_2()
-        .child(
-            text(move || match status {
-                WalletPaymentStatus::Success => "✓",
-                WalletPaymentStatus::Failed => "✕",
-                WalletPaymentStatus::Created | WalletPaymentStatus::Inflight => "⏳",
-            })
-            .text_size(px(ts::SM))
-            .text_color(move || {
+        .child(status_chip(
+            cx,
+            move || {
+                match status {
+                    WalletPaymentStatus::Success => "成功",
+                    WalletPaymentStatus::Failed => "失败",
+                    WalletPaymentStatus::Inflight => "进行中",
+                    WalletPaymentStatus::Created => "已创建",
+                }
+                .to_owned()
+            },
+            move || {
                 let colors = pal_fn(&cx);
                 match status {
                     WalletPaymentStatus::Success => colors.ok,
                     WalletPaymentStatus::Failed => colors.danger,
                     WalletPaymentStatus::Created | WalletPaymentStatus::Inflight => colors.warn,
                 }
-            }),
-        )
+            },
+        ))
         .child(
-            view().flex_1().child(
-                text(format!(
-                    "{}\n{}\n费用 {} shannons · 创建 {} · 更新 {}{}",
-                    payment.status,
-                    theme::short_id(&payment.payment_hash, 10),
-                    payment.fee_shannons,
-                    crate::bridge::timestamp(payment.created_at_ms),
-                    crate::bridge::timestamp(payment.last_updated_at_ms),
-                    payment
-                        .failed_error
-                        .as_ref()
-                        .map(|error| format!("\n{error}"))
-                        .unwrap_or_default(),
-                ))
-                .text_size(px(ts::XS))
-                .font_family(theme::mono_family)
-                .text_color(move || pal_fn(&cx).fg_muted),
-            ),
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    text(hash)
+                        .text_size(px(ts::XS))
+                        .font_family(theme::mono_family)
+                        .text_color(move || pal_fn(&cx).fg),
+                )
+                .child(
+                    text(format!(
+                        "费用 {fee} shannons · 创建 {created} · 更新 {updated}"
+                    ))
+                    .text_size(px(ts::XS))
+                    .font_family(theme::mono_family)
+                    .text_color(move || pal_fn(&cx).fg_muted),
+                )
+                .when_some(failed_error.clone(), |row, error| {
+                    row.child(
+                        text(error)
+                            .text_size(px(ts::XS))
+                            .font_family(theme::mono_family)
+                            .text_color(move || pal_fn(&cx).danger),
+                    )
+                }),
         )
 }

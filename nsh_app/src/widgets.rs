@@ -115,10 +115,117 @@ pub fn pal_fn(cx: &Cx) -> Palette {
 
 pub fn card(cx: Cx) -> View {
     view()
-        .rounded(px(12.0))
+        .rounded(px(14.0))
         .bg(move || pal_fn(&cx).card)
         .border_1()
         .border_color(move || pal_fn(&cx).border)
+        .shadow_xs()
+}
+
+/// A card the user can click: hover lifts it (border + shadow) so targets
+/// feel alive.
+pub fn card_interactive(cx: Cx) -> View {
+    view()
+        .rounded(px(14.0))
+        .bg(move || pal_fn(&cx).card)
+        .border_1()
+        .border_color(move || pal_fn(&cx).border)
+        .shadow_xs()
+        .cursor_pointer()
+        .transition_all()
+        .duration(140.0)
+        .hover(|style| {
+            style
+                .border_color(pal_fn(&cx).accent.opacity(0.45))
+                .shadow_md()
+        })
+        .active(|style| style.opacity(0.85))
+}
+
+/// A small rounded status badge: soft tinted background, colored text
+/// (channel states, payment outcomes, network tags…).
+pub fn status_chip(
+    _cx: Cx,
+    label: impl Fn() -> String + 'static,
+    color: impl Fn() -> Hsla + Clone + 'static,
+) -> View {
+    let bg = color.clone();
+    let fg = color;
+    view()
+        .flex_row()
+        .items_center()
+        .px_2()
+        .py(px(2.0))
+        .rounded(px(6.0))
+        .bg(move || bg().opacity(0.13))
+        .child(
+            text(label)
+                .text_size(px(ts::XS))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(fg),
+        )
+}
+
+/// A home-page quick action: glyph tile + title + hint, the whole card
+/// clickable with a hover lift.
+pub fn quick_action(
+    cx: Cx,
+    glyph: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    on_press: impl Fn() + 'static,
+) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .p_4()
+        .rounded(px(14.0))
+        .bg(move || pal_fn(&cx).card)
+        .border_1()
+        .border_color(move || pal_fn(&cx).border)
+        .shadow_xs()
+        .flex_1()
+        .min_w(px(0.0))
+        .cursor_pointer()
+        .transition_all()
+        .duration(140.0)
+        .hover(|style| {
+            style
+                .border_color(pal_fn(&cx).accent.opacity(0.45))
+                .shadow_md()
+        })
+        .active(|style| style.opacity(0.85))
+        .on_press(on_press)
+        .child(
+            view()
+                .size(px(38.0))
+                .items_center()
+                .justify_center()
+                .rounded(px(10.0))
+                .bg(move || pal_fn(&cx).accent_soft)
+                .child(
+                    text(glyph)
+                        .text_size(px(ts::LG))
+                        .text_color(move || pal_fn(&cx).accent),
+                ),
+        )
+        .child(
+            view()
+                .gap_0()
+                .min_w(px(0.0))
+                .child(
+                    text(title)
+                        .text_size(px(ts::MD))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(move || pal_fn(&cx).fg),
+                )
+                .child(
+                    text(hint)
+                        .text_size(px(ts::XS))
+                        .text_color(move || pal_fn(&cx).fg_muted),
+                ),
+        )
 }
 
 pub fn section_label(cx: Cx, label: &'static str) -> View {
@@ -223,8 +330,11 @@ pub fn primary_button(
                 colors.card_alt
             }
         })
-        .active(|style| style.opacity(0.8))
         .cursor_pointer()
+        .transition_all()
+        .duration(140.0)
+        .hover(|style| style.opacity(0.9))
+        .active(|style| style.opacity(0.78))
         .on_press(move || {
             if enabled() {
                 on_press();
@@ -262,8 +372,11 @@ pub fn outline_button(
         .rounded(px(10.0))
         .border_1()
         .border_color(move || pal_fn(&cx).border)
-        .active(|style| style.opacity(0.75))
         .cursor_pointer()
+        .transition_all()
+        .duration(140.0)
+        .hover(move |style| style.bg(pal_fn(&cx).card_alt))
+        .active(|style| style.opacity(0.75))
         .on_press(move || {
             if enabled() {
                 on_press();
@@ -338,12 +451,21 @@ pub fn segmented(cx: Cx, options: &[&'static str], active: Signal<usize>) -> Vie
                 .py(px(5.0))
                 .rounded(px(8.0))
                 .cursor_pointer()
+                .transition_all()
+                .duration(140.0)
                 .bg(move || {
                     let colors = pal_fn(&cx);
                     if selected.get() == index {
                         colors.card
                     } else {
                         transparent_black()
+                    }
+                })
+                .hover(move |style| {
+                    if selected.get() != index {
+                        style.bg(pal_fn(&cx).card_alt.opacity(0.6))
+                    } else {
+                        style
                     }
                 })
                 .on_press(move || active.set(index))

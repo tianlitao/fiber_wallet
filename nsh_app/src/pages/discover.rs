@@ -149,6 +149,7 @@ fn dapp_catalog(cx: Cx) -> View {
         })
         .child(
             view()
+                .flex_row()
                 .flex_wrap()
                 .gap_4()
                 .children(registry.iter().map(|dapp| dapp_card(cx, dapp.clone()))),
@@ -171,11 +172,20 @@ fn dapp_card(cx: Cx, dapp: DappEntry) -> View {
         .w(px(300.0))
         .gap_3()
         .p_5()
-        .rounded(px(12.0))
+        .rounded(px(14.0))
         .bg(move || pal_fn(&cx).card)
         .border_1()
         .border_color(move || pal_fn(&cx).border)
+        .shadow_xs()
         .cursor_pointer()
+        .transition_all()
+        .duration(140.0)
+        .hover(|style| {
+            style
+                .border_color(pal_fn(&cx).accent.opacity(0.45))
+                .shadow_md()
+        })
+        .active(|style| style.opacity(0.85))
         .on_press(move || open_dapp(cx, &id))
         .child(
             view()
