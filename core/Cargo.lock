@@ -1999,8 +1999,10 @@ dependencies = [
 name = "fiber_wallet_core"
 version = "0.2.0"
 dependencies = [
+ "bech32 0.9.1",
  "cc",
  "ckb-chain-spec",
+ "ckb-hash",
  "ckb-jsonrpc-types",
  "ckb-resource",
  "ckb-sdk",

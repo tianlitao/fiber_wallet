@@ -5,6 +5,7 @@
 
 pub mod keychain;
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use fiber_wallet_core::api::node::NodePhase;
@@ -24,23 +25,56 @@ fn native(registry: &mut Registry) {
 /// The application's root component.
 #[component]
 pub fn App() -> impl IntoElement {
+    // The iOS runner installs only a `log` logger; without this the bridge's
+    // tracing output (and 首页 → 节点事件) would be empty. Runs before the
+    // Keychain and the bridge so their startup lines are captured too.
+    install_tracing();
+    tracing::warn!("ios shell: App() entered");
+    // Loads config.json (theme, accent, proxy) and applies the proxy env
+    // before any RPC client is built, as the macOS binary does in `main`.
+    // This must be `load`, not `get`: `get` is `get_or_init(load)`, and
+    // `load` itself writes the same OnceLock — the first `get` caller
+    // would wait on its own initialization forever.
+    let config = shared::config::load();
+    tracing::info!(
+        mode = ?config.theme_mode,
+        accent = ?config.accent,
+        proxy_enabled = config.proxy_enabled,
+        "config loaded"
+    );
     // Before the bridge initializes: the password comes from the Keychain and
     // is exported through FIBER_SECRET_KEY_PASSWORD, which the bridge reads
     // before its file fallback.
-    tracing::warn!("ios shell: App() entered");
     keychain::install_keychain_password();
     tracing::warn!("ios shell: keychain done");
 
     let cx = Cx {
         config: signal(shared::config::get().clone()),
-        nav: signal(Nav::Home),
+        nav: signal(Nav::Discover), // TEMP-VERIFY: dApp host on iOS
         trade_tab: signal(0_usize),
         ui: signal(bridge::WalletBridge::global().state()),
         invoice_history: signal(Vec::new()),
-        swap_amount: signal(String::new()),
+        transfer_target: signal(String::new()),
+        transfer_amount: signal(String::new()),
+        transfer_max_fee: signal(String::from("0.01")),
+        onchain_address: signal(String::new()),
+        onchain_amount: signal(String::new()),
+        onchain_max_fee: signal(String::from("0.001")),
+        onchain_confirming: signal(false),
+        onchain_validation_error: signal(None),
         receive_amount: signal(String::new()),
         receive_description: signal(String::new()),
         pay_invoice: signal(String::new()),
+        channel_peer: signal(String::new()),
+        channel_address: signal(String::new()),
+        channel_amount: signal(String::new()),
+        channel_public: signal(true),
+        dapp_open: signal(Some("builtin:protocol-selftest".to_owned())), // TEMP-VERIFY
+        dapp_navigation: signal(None),
+        dapp_loading: signal(false),
+        dapp_error: signal(None),
+        dapp_outbox: signal(Vec::new()),
+        dapp_generation: signal(0_u64),
     };
 
     // Persist config edits (theme, accent, proxy) as they happen.
@@ -49,17 +83,32 @@ pub fn App() -> impl IntoElement {
         shared::config::save(&snapshot);
     });
 
-    // Copy bridge state into the UI's signal a few times a second; the
-    // bridge is the source of truth.
-    let bridge = bridge::WalletBridge::global();
-    let ui = cx.ui;
-    spawn(async move {
-        loop {
-            timer(Duration::from_millis(400)).await;
-            ui.set(bridge.state());
+    // Surface every bridge operation result as a toast, keyed on a strictly
+    // increasing sequence so one flash is announced exactly once.
+    let seen_flash = signal(0_u64);
+    effect(move || {
+        if let Some(flash) = cx.ui.get().flash
+            && flash.seq > seen_flash.get()
+        {
+            seen_flash.set(flash.seq);
+            toast(flash.message, ToastDuration::Long);
         }
     });
-    tracing::warn!("ios shell: bridge initialized, building view");
+
+    // Copy bridge state into the UI's signal a few times a second; the
+    // bridge is the source of truth. The log tail rides along so 首页's
+    // 节点事件 card renders a rolling console of the tracing output.
+    let bridge = bridge::WalletBridge::global();
+    let ui = cx.ui;
+    let poller = spawn(async move {
+        loop {
+            timer(Duration::from_millis(400)).await;
+            let mut state = bridge.state();
+            state.log_tail = shared::logs::global().tail(80);
+            ui.set(state);
+        }
+    });
+    cleanup(move || poller.cancel());
     bridge.initialize_and_start();
 
     view()
@@ -68,25 +117,31 @@ pub fn App() -> impl IntoElement {
         .text_color(move || theme::palette(&cx.config.get()).fg)
         .child(status_header(cx))
         .child(
-            safe_area_view().flex_1().child(
-                scroll().flex_1().child(
-                    view()
-                        .w_full()
-                        .p_4()
-                        .child(dynamic(move || match cx.nav.get() {
-                            Nav::Home => Some(view().child(shared::pages::home::home_page(cx))),
-                            Nav::Trade => {
-                                Some(view().child(shared::pages::trade::trade_page(cx)))
-                            }
-                            Nav::Discover => {
-                                Some(view().child(shared::pages::discover::discover_page(cx)))
-                            }
-                            Nav::Settings => {
-                                Some(view().child(shared::pages::settings::settings_page(cx)))
-                            }
-                        })),
+            safe_area_view()
+                .flex_1()
+                .child(
+                    scroll()
+                        .flex_1()
+                        .child(
+                            view()
+                                .w_full()
+                                .p_4()
+                                .child(dynamic(move || match cx.nav.get() {
+                                    Nav::Home => {
+                                        Some(view().child(shared::pages::home::home_page(cx)))
+                                    }
+                                    Nav::Trade => {
+                                        Some(view().child(shared::pages::trade::trade_page(cx)))
+                                    }
+                                    Nav::Discover => Some(
+                                        view().child(shared::pages::discover::discover_page(cx)),
+                                    ),
+                                    Nav::Settings => Some(
+                                        view().child(shared::pages::settings::settings_page(cx)),
+                                    ),
+                                })),
+                        ),
                 ),
-            ),
         )
         .child(tab_bar(cx))
 }
@@ -123,53 +178,83 @@ fn status_header(cx: Cx) -> View {
                         .font_weight(FontWeight::SEMIBOLD),
                 ),
         )
-        .child(
-            dynamic(move || {
-                let ui = bridge::WalletBridge::global().state();
-                let Some(snapshot) = ui.snapshot else {
-                    return view().child(text("…").text_size(px(theme::type_scale::SM)));
-                };
+        .child(dynamic(move || {
+            let ui = bridge::WalletBridge::global().state();
+            let Some(snapshot) = ui.snapshot else {
+                return view().child(text("…").text_size(px(theme::type_scale::SM)));
+            };
 
-                let (label, color_key): (&str, fn(&theme::Palette) -> Hsla) = match snapshot.phase
-                {
-                    NodePhase::Running => ("节点在线", |p| p.accent),
-                    NodePhase::Starting | NodePhase::Stopping => ("切换中", |p| p.fg_muted),
-                    NodePhase::Stopped => ("离线", |p| p.fg_muted),
-                    NodePhase::Failed => ("失败", |p| p.danger),
-                };
-                let colors = pal_fn(&cx);
-                let pill = view()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(999.0))
-                    .bg(colors.card)
-                    .child(
-                        view()
-                            .size(px(7.0))
-                            .rounded(px(999.0))
-                            .bg(color_key(&colors)),
-                    )
-                    .child(
-                        text(label)
-                            .text_size(px(theme::type_scale::SM))
-                            .text_color(colors.fg_muted),
-                    );
+            let (label, color_key): (&str, fn(&theme::Palette) -> Hsla) = match snapshot.phase {
+                NodePhase::Running => ("节点在线", |p| p.accent),
+                NodePhase::Starting | NodePhase::Stopping => ("切换中", |p| p.fg_muted),
+                NodePhase::Stopped => ("离线", |p| p.fg_muted),
+                NodePhase::Failed => ("失败", |p| p.danger),
+            };
+            let colors = pal_fn(&cx);
+            let pill = view()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(px(999.0))
+                .bg(colors.card)
+                .child(
+                    view()
+                        .size(px(7.0))
+                        .rounded(px(999.0))
+                        .bg(color_key(&colors)),
+                )
+                .child(
+                    text(label)
+                        .text_size(px(theme::type_scale::SM))
+                        .text_color(colors.fg_muted),
+                );
 
-                if snapshot.phase == NodePhase::Failed {
-                    pill.child(
-                        text("重试")
-                            .text_size(px(theme::type_scale::SM))
-                            .text_color(pal_fn(&cx).accent)
-                            .on_press(move || bridge::WalletBridge::global().start()),
-                    )
-                } else {
-                    pill
-                }
-            }),
-        )
+            if snapshot.phase == NodePhase::Failed {
+                pill.child(
+                    text("重试")
+                        .text_size(px(theme::type_scale::SM))
+                        .text_color(pal_fn(&cx).accent)
+                        .on_press(move || bridge::WalletBridge::global().start()),
+                )
+            } else {
+                pill
+            }
+        }))
+}
+
+/// Installs the tracing stack the macOS binary sets up in `main`: the same
+/// env filter (default `info`) over a stdout layer and the in-memory tail
+/// that 首页 → 节点事件 renders. The iOS runner only configures the `log`
+/// crate, so the shell must install the subscriber itself, before the bridge
+/// or the Keychain log anything.
+fn install_tracing() {
+    use tracing_subscriber::prelude::*;
+
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let log_tail = shared::logs::global().clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_ansi(false),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(log_tail),
+            );
+        // Another subscriber may already be installed (a future runner or a
+        // host integration); keep theirs rather than panicking.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
 }
 
 /// The bottom tab bar: icon above label, one entry per page.
@@ -184,7 +269,9 @@ fn tab_bar(cx: Cx) -> View {
         .border_t(px(1.0))
         .border_t_color(move || pal_fn(&cx).border)
         .bg(move || theme::palette(&cx.config.get()).bg)
-        .children([Nav::Home, Nav::Trade, Nav::Discover, Nav::Settings].map(|item| tab_item(cx, item)))
+        .children(
+            [Nav::Home, Nav::Trade, Nav::Discover, Nav::Settings].map(|item| tab_item(cx, item)),
+        )
 }
 
 fn tab_item(cx: Cx, item: Nav) -> View {

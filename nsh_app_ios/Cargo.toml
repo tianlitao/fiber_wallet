@@ -12,6 +12,7 @@ fiber_wallet_core = { path = "../core" }
 nsh-core = "0.2.0"
 nsh-base = "0.2.0"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 security-framework = "3"
 
 # The macOS shell owns the bridge, theme, widgets, and pages; the iOS shell

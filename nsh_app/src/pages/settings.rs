@@ -23,15 +23,12 @@ pub fn settings_page(cx: Cx) -> View {
 }
 
 fn settings_group(cx: Cx, title: &'static str) -> View {
-    card(cx)
-        .p_6()
-        .gap_4()
-        .child(
-            text(title)
-                .text_size(px(ts::MD))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(move || pal_fn(&cx).fg),
-        )
+    card(cx).p_6().gap_4().child(
+        text(title)
+            .text_size(px(ts::MD))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(move || pal_fn(&cx).fg),
+    )
 }
 
 fn appearance_card(cx: Cx) -> View {
@@ -142,7 +139,6 @@ fn proxy_card(cx: Cx) -> View {
         String::new()
     });
     let enabled = signal(cx.config.get().proxy_enabled);
-    let ui = WalletBridge::global();
 
     view().child(
         settings_group(cx, "代理")
@@ -195,7 +191,7 @@ fn proxy_card(cx: Cx) -> View {
                         outline_button(
                             cx,
                             "重启节点生效",
-                            move || !ui.state().busy,
+                            move || !cx.ui_state().busy,
                             move || {
                                 WalletBridge::global().restart();
                                 toast("节点重启中，稍候自动恢复在线", ToastDuration::Short);
@@ -268,7 +264,7 @@ fn security_card(cx: Cx) -> View {
                     .child(outline_button(
                         cx,
                         "轮换",
-                        move || !ui.state().password_busy && !env_override,
+                        move || !cx.ui_state().password_busy && !env_override,
                         move || {
                             let new_password: String = (0..32)
                                 .map(|_| format!("{:02x}", rand::random::<u8>()))
@@ -285,10 +281,10 @@ fn security_card(cx: Cx) -> View {
                 )
             })
             .child(dynamic(move || {
-                ui.state().password_busy.then(|| view().child(spinner(cx)))
+                cx.ui_state().password_busy.then(|| view().child(spinner(cx)))
             }))
             .child(dynamic(move || {
-                let state = ui.state();
+                let state = cx.ui_state();
                 state
                     .password_message
                     .clone()
@@ -306,7 +302,6 @@ fn security_card(cx: Cx) -> View {
 /// 导出 / 导入: whole wallet state (keystore + channel store) as a
 /// password-encrypted archive. Node must be stopped for both.
 fn backup_card(cx: Cx) -> View {
-    let ui = WalletBridge::global();
     let export_path = signal(default_export_path());
     let export_password = signal(String::new());
     let export_confirm = signal(String::new());
@@ -345,7 +340,7 @@ fn backup_card(cx: Cx) -> View {
                             cx,
                             "导出钱包状态",
                             move || {
-                                let state = ui.state();
+                                let state = cx.ui_state();
                                 !state.backup_busy
                                     && state.snapshot.as_ref().map(|s| s.phase)
                                         != Some(NodePhase::Running)
@@ -403,7 +398,7 @@ fn backup_card(cx: Cx) -> View {
                     cx,
                     "导入钱包状态",
                     move || {
-                        let state = ui.state();
+                        let state = cx.ui_state();
                         !state.backup_busy
                             && state.snapshot.as_ref().map(|s| s.phase) != Some(NodePhase::Running)
                     },
@@ -418,10 +413,10 @@ fn backup_card(cx: Cx) -> View {
                 ),
             )
             .child(dynamic(move || {
-                ui.state().backup_busy.then(|| view().child(spinner(cx)))
+                cx.ui_state().backup_busy.then(|| view().child(spinner(cx)))
             }))
             .child(dynamic(move || {
-                let state = ui.state();
+                let state = cx.ui_state();
                 state
                     .backup_message
                     .clone()
@@ -456,7 +451,6 @@ fn default_export_path() -> String {
 }
 
 fn node_card(cx: Cx) -> View {
-    let ui = WalletBridge::global();
     view().child(
         settings_group(cx, "节点")
             .child(detail_row(cx, "网络", || "CKB Fiber 测试网".to_owned()))
@@ -475,7 +469,7 @@ fn node_card(cx: Cx) -> View {
             )
             .child(detail_row(cx, "节点版本", {
                 move || {
-                    ui.state()
+                    cx.ui_state()
                         .node_info
                         .map(|info| info.version)
                         .unwrap_or_else(|| "—".to_owned())
@@ -483,11 +477,11 @@ fn node_card(cx: Cx) -> View {
             }))
             .child(detail_row(cx, "Node ID", {
                 move || {
-                    ui.state()
+                    cx.ui_state()
                         .node_info
                         .map(|info| info.node_id)
                         .or_else(|| {
-                            ui.state()
+                            cx.ui_state()
                                 .snapshot
                                 .and_then(|snapshot| snapshot.node_id)
                         })

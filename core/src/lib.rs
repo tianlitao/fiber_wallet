@@ -8,6 +8,9 @@ pub mod api;
 pub mod backup;
 pub mod keystore;
 pub mod node;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod onchain;
+mod payment;
 pub mod recovery_smoke;
 pub mod types;
 

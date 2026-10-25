@@ -5,13 +5,19 @@
 use std::time::Duration;
 
 pub mod bridge;
-pub mod vault;
+pub mod channel_close;
 pub mod config;
+pub mod dapp_host;
+pub mod dapp_protocol;
+pub mod dapp_registry;
+pub mod logs;
 pub mod pages;
 pub mod theme;
+pub mod vault;
 pub mod widgets;
 
 use nsh_base::safe_area_view;
+#[cfg(not(target_os = "ios"))]
 use nsh_core::desktop::TitleBarStyle;
 #[cfg(not(target_os = "ios"))]
 use nsh_core::ui::desktop::{set_title_bar, title_bar};
@@ -42,7 +48,14 @@ pub fn App() -> impl IntoElement {
             bridge::WalletBridge::global().state()
         }),
         invoice_history: signal(Vec::new()),
-        swap_amount: signal(String::new()),
+        transfer_target: signal(String::new()),
+        transfer_amount: signal(String::new()),
+        transfer_max_fee: signal(String::from("0.01")),
+        onchain_address: signal(String::new()),
+        onchain_amount: signal(String::new()),
+        onchain_max_fee: signal(String::from("0.001")),
+        onchain_confirming: signal(false),
+        onchain_validation_error: signal(None),
         receive_amount: signal(String::new()),
         receive_description: signal(String::new()),
         pay_invoice: signal(String::new()),
@@ -50,6 +63,12 @@ pub fn App() -> impl IntoElement {
         channel_address: signal(String::new()),
         channel_amount: signal(String::new()),
         channel_public: signal(true),
+        dapp_open: signal(None),
+        dapp_generation: signal(0_u64),
+        dapp_navigation: signal(None),
+        dapp_loading: signal(false),
+        dapp_error: signal(None),
+        dapp_outbox: signal(Vec::new()),
     };
 
     // Persist config edits (theme, accent, proxy) as they happen.
@@ -58,8 +77,21 @@ pub fn App() -> impl IntoElement {
         config::save(&snapshot);
     });
 
+    // Surface every bridge operation result as a toast, keyed on a strictly
+    // increasing sequence so one flash is announced exactly once.
+    let seen_flash = signal(0_u64);
+    effect(move || {
+        if let Some(flash) = cx.ui.get().flash
+            && flash.seq > seen_flash.get()
+        {
+            seen_flash.set(flash.seq);
+            toast(flash.message, ToastDuration::Long);
+        }
+    });
+
     // Copy bridge state into the UI's signal a few times a second; the
-    // bridge is the source of truth.
+    // bridge is the source of truth. The log tail rides along so 首页's
+    // 节点事件 card renders a rolling console of the tracing output.
     // The loop is cancelled when the root goes away, so the engine can shut
     // down (headless tests join it).
     if !test_mode {
@@ -67,7 +99,9 @@ pub fn App() -> impl IntoElement {
         let poller = spawn(async move {
             loop {
                 timer(Duration::from_millis(400)).await;
-                cx.ui.set(bridge.state());
+                let mut state = bridge.state();
+                state.log_tail = logs::global().tail(80);
+                cx.ui.set(state);
             }
         });
         cleanup(move || poller.cancel());
@@ -80,39 +114,26 @@ pub fn App() -> impl IntoElement {
         .text_color(move || theme::palette(&cx.config.get()).fg)
         .child(app_title_bar(cx))
         .child(
-            view()
-                .flex_1()
-                .flex_row()
-                .child(sidebar(cx))
-                .child(
-                    safe_area_view().flex_1().child(
-                        scroll().flex_1().child(
-                            view()
-                                .w_full()
-                                .items_center()
-                                .child(
-                                    view()
-                                        .w_full()
-                                        .max_w(px(1080.0))
-                                        .p_6()
-                                        .child(dynamic(move || match cx.nav.get() {
-                                            Nav::Home => {
-                                                Some(view().child(pages::home::home_page(cx)))
-                                            }
-                                            Nav::Trade => {
-                                                Some(view().child(pages::trade::trade_page(cx)))
-                                            }
-                                            Nav::Discover => {
-                                                Some(view().child(pages::discover::discover_page(cx)))
-                                            }
-                                            Nav::Settings => {
-                                                Some(view().child(pages::settings::settings_page(cx)))
-                                            }
-                                        })),
-                                ),
+            view().flex_1().flex_row().child(sidebar(cx)).child(
+                safe_area_view().flex_1().child(
+                    scroll().flex_1().child(
+                        view().w_full().items_center().child(
+                            view().w_full().max_w(px(1080.0)).p_6().child(dynamic(
+                                move || match cx.nav.get() {
+                                    Nav::Home => Some(view().child(pages::home::home_page(cx))),
+                                    Nav::Trade => Some(view().child(pages::trade::trade_page(cx))),
+                                    Nav::Discover => {
+                                        Some(view().child(pages::discover::discover_page(cx)))
+                                    }
+                                    Nav::Settings => {
+                                        Some(view().child(pages::settings::settings_page(cx)))
+                                    }
+                                },
+                            )),
                         ),
                     ),
                 ),
+            ),
         )
 }
 
@@ -158,7 +179,6 @@ fn app_title_bar(_cx: Cx) -> View {
 }
 
 fn sidebar(cx: Cx) -> View {
-    let ui = bridge::WalletBridge::global();
     view()
         .w(px(208.0))
         .h_full()
@@ -201,21 +221,13 @@ fn sidebar(cx: Cx) -> View {
                 ),
         )
         .children(Nav::ALL.iter().map(|item| nav_item(cx, *item)))
+        .child(view().flex_1())
         .child(
-            view()
-                .flex_1(),
-        )
-        .child(
-            view()
-                .gap_1()
-                .px_2()
-                .py_3()
-                .child(node_line(cx, ui))
-                .child(
-                    text("CKB Fiber 测试网")
-                        .text_size(px(ts::XS))
-                        .text_color(move || pal_fn(&cx).fg_muted),
-                ),
+            view().gap_1().px_2().py_3().child(node_line(cx)).child(
+                text("CKB Fiber 测试网")
+                    .text_size(px(ts::XS))
+                    .text_color(move || pal_fn(&cx).fg_muted),
+            ),
         )
 }
 
@@ -272,13 +284,14 @@ fn nav_item(cx: Cx, item: Nav) -> View {
         )
 }
 
-fn node_line(cx: Cx, ui: &'static bridge::WalletBridge) -> View {
+fn node_line(cx: Cx) -> View {
     view().child(dynamic(move || {
-        let state = ui.state();
+        let state = cx.ui_state();
         let colors = theme::palette(&cx.config.get());
         let (glyph, label, color) = match state.snapshot.map(|snapshot| snapshot.phase) {
             Some(NodePhase::Running) => ("●", "节点在线", colors.ok),
-            Some(NodePhase::Starting) | Some(NodePhase::Stopping) => ("◌", "节点切换中", colors.warn),
+            Some(NodePhase::Starting) => ("◌", "节点启动中", colors.warn),
+            Some(NodePhase::Stopping) => ("◌", "节点停止中", colors.warn),
             Some(NodePhase::Failed) => ("✕", "节点故障", colors.danger),
             _ => ("○", "节点离线", colors.fg_muted),
         };

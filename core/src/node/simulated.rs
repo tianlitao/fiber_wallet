@@ -1,10 +1,13 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::types::{NodeNetwork, NodePhase, NodeSnapshot};
 use crate::types::{
-    WalletChannel, WalletInvoice, WalletNodeInfo, WalletOpenedChannel, WalletPayment, WalletPeer,
+    ChannelCloseRequest, OnchainTransferError, WalletChannel, WalletChannelCloseResult,
+    WalletInvoice, WalletNodeInfo, WalletOnchainTransfer, WalletOnchainTxStatus,
+    WalletOpenedChannel, WalletPayment, WalletPaymentStatus, WalletPeer, WalletSendPaymentRequest,
+    WalletSendPaymentResult,
 };
+use crate::types::{NodeNetwork, NodePhase, NodeSnapshot};
 
 const START_DELAY: Duration = Duration::from_millis(300);
 const STOP_DELAY: Duration = Duration::from_millis(180);
@@ -115,6 +118,13 @@ impl NodeMachine {
         Self::wallet_unavailable()
     }
 
+    pub async fn wallet_close_channel(
+        &self,
+        _request: ChannelCloseRequest,
+    ) -> Result<WalletChannelCloseResult, String> {
+        Self::wallet_unavailable()
+    }
+
     pub async fn wallet_new_invoice(
         &self,
         _amount_shannons: u64,
@@ -133,6 +143,52 @@ impl NodeMachine {
 
     pub async fn wallet_send_payment(&self, _invoice: String) -> Result<WalletPayment, String> {
         Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_send_payment_request(
+        &self,
+        request: WalletSendPaymentRequest,
+    ) -> Result<WalletSendPaymentResult, String> {
+        request.validate()?;
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_poll_payment_terminal(
+        &self,
+        _payment_hash: String,
+        expected_status: Option<WalletPaymentStatus>,
+        timeout: Duration,
+    ) -> Result<WalletPayment, String> {
+        if expected_status.is_some_and(WalletPaymentStatus::is_terminal) {
+            return Err(
+                "expected_status must be Created or Inflight; terminal states are returned by polling"
+                    .to_owned(),
+            );
+        }
+        if timeout.is_zero() {
+            return Err("payment polling timeout must be greater than 0".to_owned());
+        }
+        Self::wallet_unavailable()
+    }
+
+    pub async fn wallet_onchain_transfer(
+        &self,
+        _target_address: String,
+        _amount_shannons: u64,
+        _max_fee_shannons: u64,
+    ) -> Result<WalletOnchainTransfer, OnchainTransferError> {
+        Err(OnchainTransferError::Unavailable {
+            detail: "模拟后端不广播链上交易".to_owned(),
+        })
+    }
+
+    pub async fn wallet_onchain_transfer_status(
+        &self,
+        _tx_hash: String,
+    ) -> Result<WalletOnchainTxStatus, OnchainTransferError> {
+        Err(OnchainTransferError::Unavailable {
+            detail: "模拟后端不查询链上交易状态".to_owned(),
+        })
     }
 }
 

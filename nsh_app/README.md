@@ -16,12 +16,17 @@ nsh test           # headless TSX test of the mounted shell
 Icon sidebar with four pages:
 
 - **首页** — total balance (on-chain + channels), stat cards, quick actions
-  (收款 / 付款 / Swap), recent payments and node events.
-- **交易** — Swap (simulated quote/router until M3+), 收款 (create invoice),
-  付款 (pay invoice + payment history).
-- **发现** — dApp entry grid, reserved for M3+ (signed TSX module delivery).
+  (收款 / 付款 / Fiber 转账), recent payments and node events.
+- **交易** — five tabs: Fiber 转账 (real same-asset keysend: dry-run quote →
+  explicit confirm → real send → terminal state), 链上 CKB (on-chain testnet
+  transfer with two-step confirmation + broadcast status), 收款 (create
+  invoice + QR), 付款 (pay invoice + payment history), 通道 (open/close).
+- **发现** — dApp provider host: registry + sandboxed WKWebView running
+  `window.fiberWallet` (`src/dapp_host.rs`, `dapp_protocol.rs`,
+  `dapp_registry.rs`); writes require default-deny approval dialogs.
 - **设置** — theme mode (跟随系统/浅色/深色), accent color (CKB 薄荷 / Fiber 青
-  / 极光蓝 / 星紫 / 琥珀), HTTP(S) proxy, node info, about.
+  / 极光蓝 / 星紫 / 琥珀), HTTP(S) proxy, node info, keystore password
+  rotation, backup export/import, about.
 
 ## Theming
 
@@ -57,11 +62,16 @@ Longbridge-like (11/12/13/14/16/18/20/28).
   re-recorded on theme changes.
 - **Title bar**: the system title bar is hidden; the app draws its own
   draggable bar (`window_drag`), leaving macOS traffic lights their space.
-- **Toasts** on proxy save, node restart, dApp cards, and simulated swap
-  completion.
-- **Swap**: simulated mid-market rate with live jitter and 0.3% route fee
-  display until a real Fiber router lands in M3+; amount validation, flip
-  direction.
+- **Toasts** on proxy save, node restart, dApp cards, and close-mode
+  validation.
+- **Fiber 转账 (Swap tab)**: real Fiber same-asset keysend — a dry-run
+  returns a route/fee quote (no HTLC, no payment record), an explicit confirm
+  sends the real payment and waits for Fiber's terminal state. Cross-asset
+  CKB↔rUSDT is explicitly marked unavailable (no AMM/order-book provider;
+  Fiber v0.9.1 routes require one asset end to end).
+- **链上 CKB**: builds/signs/broadcasts a testnet transaction from the
+  funding lock (ckb-sdk), testnet-only address validation, fee cap re-checked
+  after signing; broadcast accepted ≠ confirmed (status query button).
 - **Session invoice history**: 收款 keeps the invoices created this session
   (node restarts drop the last one, the list keeps them).
 - **Settings → 节点**: open the data directory in Finder.
@@ -100,6 +110,6 @@ logs everything).
 
 Data directory: `~/Library/Application Support/FiberWalletNSH/fiber-wallet`
 (own directory, so `wallet.lock` never contends with another host). Key
-password: `FIBER_SECRET_KEY_PASSWORD` env, else a random hex password
-persisted 0600 at `<data dir>/.key-password` — dev-only fallback until M2's
-Keychain work.
+password: `FIBER_SECRET_KEY_PASSWORD` env, else the macOS Keychain
+(`dev.fiberwallet.nsh` / `ckb-key-password`); a legacy `.key-password` file
+is adopted into the Keychain on first run.

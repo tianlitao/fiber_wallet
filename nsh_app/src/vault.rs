@@ -33,7 +33,11 @@ const FILE_NAME: &str = ".key-password";
 /// `FIBER_SECRET_KEY_PASSWORD` env → Keychain → generate + Keychain →
 /// generate + file (when the Keychain is unavailable).
 pub fn load_or_create(data_dir: &Path) -> (String, VaultKind) {
-    if let Some(password) = std::env::var("FIBER_SECRET_KEY_PASSWORD").ok().map(|password| password.trim().to_owned()).filter(|password| !password.is_empty()) {
+    if let Some(password) = std::env::var("FIBER_SECRET_KEY_PASSWORD")
+        .ok()
+        .map(|password| password.trim().to_owned())
+        .filter(|password| !password.is_empty())
+    {
         return (password, VaultKind::Env);
     }
 

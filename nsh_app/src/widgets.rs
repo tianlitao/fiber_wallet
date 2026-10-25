@@ -17,7 +17,14 @@ pub struct Cx {
     /// Invoices created this session (newest first).
     pub invoice_history: Signal<Vec<fiber_wallet_core::api::wallet::WalletInvoice>>,
     /// Cross-page inputs, so they survive tab and page switches.
-    pub swap_amount: Signal<String>,
+    pub transfer_target: Signal<String>,
+    pub transfer_amount: Signal<String>,
+    pub transfer_max_fee: Signal<String>,
+    pub onchain_address: Signal<String>,
+    pub onchain_amount: Signal<String>,
+    pub onchain_max_fee: Signal<String>,
+    pub onchain_confirming: Signal<bool>,
+    pub onchain_validation_error: Signal<Option<String>>,
     pub receive_amount: Signal<String>,
     pub receive_description: Signal<String>,
     pub pay_invoice: Signal<String>,
@@ -25,6 +32,35 @@ pub struct Cx {
     pub channel_address: Signal<String>,
     pub channel_amount: Signal<String>,
     pub channel_public: Signal<bool>,
+    /// Discover's open dApp and its native WebView navigation state. Kept in
+    /// the shared Cx so switching pages does not silently lose the session.
+    pub dapp_open: Signal<Option<String>>,
+    /// Incremented to tear down and rebuild the WebView/session.
+    pub dapp_generation: Signal<u64>,
+    pub dapp_navigation: Signal<Option<DappNavigation>>,
+    pub dapp_loading: Signal<bool>,
+    pub dapp_error: Signal<Option<String>>,
+    /// Host-to-page messages awaiting delivery. This must be a queue:
+    /// concurrent read and approval responses cannot overwrite one another.
+    pub dapp_outbox: Signal<Vec<String>>,
+}
+
+impl Cx {
+    /// Reactive snapshot of the bridge state. Rendering closures and
+    /// `dynamic`s must read this (not `WalletBridge::state()`, a plain Mutex
+    /// clone) so they subscribe to the root's 400 ms mirror and actually
+    /// re-render when the node state, balances, or busy flags change.
+    pub fn ui_state(&self) -> crate::bridge::UiState {
+        self.ui.get()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DappNavigation {
+    pub url: String,
+    pub title: String,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +95,7 @@ impl Nav {
     pub fn title(self) -> &'static str {
         match self {
             Nav::Home => "首页",
-            Nav::Trade => "交易 · Swap",
+            Nav::Trade => "交易 · Fiber 转账",
             Nav::Discover => "发现",
             Nav::Settings => "设置",
         }
@@ -120,14 +156,14 @@ pub fn page_header(cx: Cx, title: &'static str, subtitle: &'static str) -> View 
 
 /// The node status pill shown at the top of every page.
 pub fn right_status(cx: Cx) -> View {
-    let ui = crate::bridge::WalletBridge::global();
     view().child(dynamic(move || {
-        let state = ui.state();
+        let state = cx.ui_state();
         let colors = palette(&cx.config.get());
         let phase = state.snapshot.as_ref().map(|snapshot| snapshot.phase);
         let (label, glyph) = match phase {
             Some(NodePhase::Running) => ("在线", "●"),
-            Some(NodePhase::Starting) | Some(NodePhase::Stopping) => ("切换中", "◌"),
+            Some(NodePhase::Starting) => ("启动中", "◌"),
+            Some(NodePhase::Stopping) => ("停止中", "◌"),
             Some(NodePhase::Failed) => ("故障", "✕"),
             _ => ("离线", "○"),
         };
@@ -148,18 +184,10 @@ pub fn right_status(cx: Cx) -> View {
                 .bg(colors.card_alt)
                 .border_1()
                 .border_color(colors.border)
-                .child(
-                    text(glyph)
-                        .text_size(px(ts::XS))
-                        .text_color(color)
-                        .when(
-                            matches!(
-                                phase,
-                                Some(NodePhase::Starting) | Some(NodePhase::Stopping)
-                            ),
-                            |dot| dot.animate_spin(),
-                        ),
-                )
+                .child(text(glyph).text_size(px(ts::XS)).text_color(color).when(
+                    matches!(phase, Some(NodePhase::Starting) | Some(NodePhase::Stopping)),
+                    |dot| dot.animate_spin(),
+                ))
                 .child(
                     text(format!("{label} · 测试网"))
                         .text_size(px(ts::XS))
@@ -295,11 +323,7 @@ pub fn toggle(cx: Cx, value: Signal<bool>, on_change: impl Fn(bool) + 'static) -
         )
 }
 
-pub fn segmented(
-    cx: Cx,
-    options: &[&'static str],
-    active: Signal<usize>,
-) -> View {
+pub fn segmented(cx: Cx, options: &[&'static str], active: Signal<usize>) -> View {
     view()
         .flex_row()
         .p(px(3.0))
@@ -430,11 +454,7 @@ pub fn divider(cx: Cx) -> View {
     view().h(px(1.0)).w_full().bg(move || pal_fn(&cx).border)
 }
 
-pub fn detail_row(
-    cx: Cx,
-    label: &'static str,
-    value: impl Fn() -> String + 'static,
-) -> View {
+pub fn detail_row(cx: Cx, label: &'static str, value: impl Fn() -> String + 'static) -> View {
     view()
         .flex_row()
         .items_start()
@@ -475,27 +495,33 @@ use fiber_wallet_core::api::node::NodePhase;
 /// A QR code drawn on a canvas: re-recorded when the data or the theme
 /// changes. The canvas has a two-module quiet zone on the card color.
 pub fn qr_canvas(cx: Cx, data: impl Fn() -> String + 'static, size: f32) -> View {
-    view().child(canvas(move || {
-        let text = data();
-        let colors = pal_fn(&cx);
-        let mut painter = Painter::new()
-            .fill_color(colors.card)
-            .fill_rect(0.0_f32, 0.0_f32, size, size);
-        if let Ok(qr) = fast_qr::QRBuilder::new(text).ecl(fast_qr::ECL::Q).build() {
-            let modules = qr.size as f32;
-            let quiet = 2.0_f32;
-            let cell = size / (modules + quiet * 2.0);
-            painter = painter.fill_color(colors.fg);
-            for y in 0..qr.size {
-                for x in 0..qr.size {
-                    if qr[y][x].value() {
-                        let left = (x as f32 + quiet) * cell;
-                        let top = (y as f32 + quiet) * cell;
-                        painter = painter.fill_rect(left, top, cell, cell);
+    // The canvas needs an explicit layout size: the Painter's coordinates do
+    // not size the element, and an unsized canvas is laid out at 0×0.
+    view().child(
+        canvas(move || {
+            let text = data();
+            let colors = pal_fn(&cx);
+            let mut painter = Painter::new()
+                .fill_color(colors.card)
+                .fill_rect(0.0_f32, 0.0_f32, size, size);
+            if let Ok(qr) = fast_qr::QRBuilder::new(text).ecl(fast_qr::ECL::Q).build() {
+                let modules = qr.size as f32;
+                let quiet = 2.0_f32;
+                let cell = size / (modules + quiet * 2.0);
+                painter = painter.fill_color(colors.fg);
+                for y in 0..qr.size {
+                    for x in 0..qr.size {
+                        if qr[y][x].value() {
+                            let left = (x as f32 + quiet) * cell;
+                            let top = (y as f32 + quiet) * cell;
+                            painter = painter.fill_rect(left, top, cell, cell);
+                        }
                     }
                 }
             }
-        }
-        painter
-    }))
+            painter
+        })
+        .w(px(size))
+        .h(px(size)),
+    )
 }

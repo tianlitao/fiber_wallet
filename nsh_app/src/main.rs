@@ -14,12 +14,23 @@ use nsh_platform_windows as platform;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn main() -> impl std::process::Termination {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    use tracing_subscriber::prelude::*;
+
+    // Two fmt layers over one env filter: the terminal (ANSI) and an
+    // in-memory tail that 首页 → 节点事件 renders as a rolling console.
+    let log_tail = nsh_app_fiber_wallet_nsh::logs::global().clone();
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_target(false)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(log_tail),
+        )
         .init();
 
     // Loads config.json (theme, accent, proxy) and applies the proxy env

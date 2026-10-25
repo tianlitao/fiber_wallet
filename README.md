@@ -38,8 +38,23 @@ scripts/         Recovery smoke driver, Android toolchain bootstrap
   supported (Fiber's process-global chain/contract initializers are skipped
   after the first successful start).
 - Wallet operations on a running node: `wallet_node_info()`,
-  `wallet_list_channels()`, `wallet_new_invoice()`, `wallet_list_payments()`,
-  `wallet_send_payment()`, `wallet_get_payment()`.
+  `wallet_list_peers()`/`wallet_connect_peer()`, `wallet_open_channel()`,
+  `wallet_list_channels()`, `wallet_close_channel()`, `wallet_new_invoice()`,
+  `wallet_list_payments()`, `wallet_send_payment()`, `wallet_get_payment()`.
+- Payments: `wallet_send_payment_request()` takes a `WalletSendPaymentRequest`
+  (invoice or keysend with target pubkey/amount/max fee/timeout; `dry_run`
+  returns a quote without creating a payment record) and waits for Fiber's
+  terminal `Success`/`Failed`; `wallet_poll_payment_terminal()` re-awaits an
+  already-submitted payment. UDT invoices are rejected — native CKB only.
+- Channel closing uses `ChannelCloseRequest` / `ChannelCloseMode`:
+  `Cooperative` derives the wallet's default funding script as FNN's
+  `close_script`; `Force` broadcasts the latest commitment transaction and
+  deliberately omits `close_script`/`fee_rate`. The RPC result is a submission,
+  not proof of final closure; poll `wallet_list_channels()` until the channel
+  reports `Closed`.
+- On-chain CKB transfers (`wallet_onchain_transfer()` +
+  `wallet_onchain_transfer_status()`): testnet-only, funding-lock cells,
+  fee cap re-checked after signing; broadcast accepted ≠ confirmed.
 - Safety rails: an exclusive flock on `<data-dir>/wallet.lock` (one node per
   data directory), password re-encryption migration from the legacy
   development password, and stable node identity across unclean exits.
@@ -54,6 +69,13 @@ before the bridge initializes. Run the iOS shell in the simulator with:
 ```sh
 cd nsh_app_ios && nsh run --target ios --device "iPhone 17 Pro"
 ```
+
+The macOS shell's 发现 page hosts dApps as a MetaMask-style provider: dApps
+connect through an injected, nonce-bound `window.fiberWallet` and may read
+node/balance/channel/peer state after an approved connection; every write
+(invoice, payment, dry-run, channel open/close) opens a fresh default-deny
+approval dialog. dApps never see key material or arbitrary RPC. See
+`nsh_app/src/dapp_host.rs`, `dapp_protocol.rs`, and `dapp_registry.rs`.
 
 Hosts provide the secret password from platform secure storage; this crate
 never stores secrets itself.

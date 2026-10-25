@@ -8,6 +8,7 @@ use ckb_jsonrpc_types::JsonBytes;
 use ckb_resource::Resource;
 use ckb_sdk::rpc::ckb_indexer::{Order, ScriptType, SearchKey};
 use ckb_sdk::{Address, AddressPayload, NetworkType};
+use ckb_types::prelude::*;
 use fiber_json_types::invoice::Currency as InvoiceCurrency;
 use fnn::actors::RootActor;
 use fnn::ckb::client::{CkbChainClient, CkbRpcClient};
@@ -18,7 +19,10 @@ use fnn::fiber::graph::NetworkGraph;
 use fnn::fiber::network::{get_chain_hash, init_chain_hash, NetworkActorMessage};
 use fnn::fiber::types::pubkey_from_tentacle;
 use fnn::fiber::types::Hash256;
-use fnn::rpc::channel::{ChannelRpcServerImpl, ListChannelsParams, OpenChannelParams};
+use fnn::rpc::channel::{
+    ChannelRpcServerImpl, ChannelState, ListChannelsParams, OpenChannelParams,
+    ShutdownChannelParams,
+};
 use fnn::rpc::info::InfoRpcServerImpl;
 use fnn::rpc::invoice::{InvoiceRpcServerImpl, NewInvoiceParams};
 use fnn::rpc::payment::{
@@ -40,10 +44,14 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info};
 
-use crate::types::{NodeNetwork, NodePhase, NodeSnapshot};
 use crate::types::{
-    WalletChannel, WalletInvoice, WalletNodeInfo, WalletOpenedChannel, WalletPayment, WalletPeer,
+    validate_channel_close_request, ChannelCloseMode, ChannelCloseRequest, OnchainTransferError,
+    WalletChannel, WalletChannelAsset, WalletChannelCloseResult, WalletInvoice, WalletNodeInfo,
+    WalletOnchainTransfer, WalletOnchainTxStatus, WalletOpenedChannel, WalletPayment,
+    WalletPaymentQuote, WalletPaymentStatus, WalletPeer, WalletSendPaymentRequest,
+    WalletSendPaymentResult,
 };
+use crate::types::{NodeNetwork, NodePhase, NodeSnapshot};
 
 const TESTNET_CONFIG: &str = include_str!("../../assets/fiber-testnet.yml");
 const FIBER_VERSION: &str = "v0.9.1";
@@ -62,6 +70,9 @@ struct RunningNode {
     network_actor: ActorRef<NetworkActorMessage>,
     fiber_config: fnn::FiberConfig,
     ckb_config: fnn::ckb::CkbConfig,
+    /// Derived once from the encrypted CKB key at startup and reused for
+    /// balance display, channel shutdowns, and native CKB transfers.
+    funding_lock: ckb_types::packed::Script,
     /// Exclusive lock on the data directory. Held for the whole node lifetime;
     /// dropping it releases the lock.
     _data_dir_lock: File,
@@ -327,7 +338,7 @@ async fn start_runtime(data_dir: &Path, secret_password: &str) -> Result<Running
         store.clone(),
         Some(store_actor),
         network_graph,
-        default_shutdown_script,
+        default_shutdown_script.clone(),
     )
     .await;
 
@@ -384,6 +395,7 @@ async fn start_runtime(data_dir: &Path, secret_password: &str) -> Result<Running
         network_actor,
         fiber_config,
         ckb_config: ckb_config.clone(),
+        funding_lock: default_shutdown_script,
         _data_dir_lock: data_dir_lock,
     })
 }
@@ -558,9 +570,14 @@ impl NodeMachine {
             .await
             .map_err(|err| err.message().to_owned())?;
 
-        let funding_script = ckb_config
-            .get_default_funding_lock_script()
-            .map_err(|err| format!("failed to derive funding lock script: {err}"))?;
+        let funding_script = {
+            let guard = self.runtime.lock().expect("runtime poisoned");
+            guard
+                .as_ref()
+                .ok_or_else(|| "local node is not running".to_owned())?
+                .funding_lock
+                .clone()
+        };
         let funding_address = Address::new(
             NetworkType::Testnet,
             AddressPayload::from(funding_script.clone()),
@@ -572,6 +589,8 @@ impl NodeMachine {
             .wallet_list_channels()
             .await?
             .iter()
+            .filter(|channel| channel.state != "Closed")
+            .filter(|channel| channel.funding_asset.is_native_ckb())
             .filter_map(|channel| channel.local_balance.parse::<u128>().ok())
             .sum();
 
@@ -588,27 +607,90 @@ impl NodeMachine {
 
     pub async fn wallet_list_channels(&self) -> Result<Vec<WalletChannel>, String> {
         let (network_actor, store, _fiber_config, _ckb_config) = self.running_parts()?;
-        let result = ChannelRpcServerImpl::new(network_actor, store)
+        let rpc = ChannelRpcServerImpl::new(network_actor, store);
+        let active = rpc
             .list_channels(ListChannelsParams {
                 pubkey: None,
-                include_closed: None,
+                // Closed rows are retained for the channel-close UI.
+                include_closed: Some(true),
                 only_pending: None,
             })
             .await
             .map_err(|err| err.message().to_owned())?;
-
-        Ok(result
-            .channels
-            .into_iter()
-            .map(|channel| WalletChannel {
-                channel_id: hex::encode(channel.channel_id.0),
-                peer_id: channel.pubkey.to_string(),
-                state: json_variant_name(&channel.state),
-                is_inbound: channel.is_acceptor,
-                local_balance: channel.local_balance.to_string(),
-                remote_balance: channel.remote_balance.to_string(),
+        let pending = rpc
+            .list_channels(ListChannelsParams {
+                pubkey: None,
+                // `only_pending=true` is the only mode that synthesizes rows
+                // from ChannelOpenRecord before the peer has accepted a
+                // channel. FNN rejects combining it with include_closed.
+                include_closed: None,
+                only_pending: Some(true),
             })
-            .collect())
+            .await
+            .map_err(|err| err.message().to_owned())?;
+
+        let mut channels = active.channels;
+        for channel in pending.channels {
+            if !channels
+                .iter()
+                .any(|known| known.channel_id == channel.channel_id)
+            {
+                channels.push(channel);
+            }
+        }
+        channels.sort_by_key(|channel| std::cmp::Reverse(channel.created_at));
+
+        Ok(channels.into_iter().map(wallet_channel_from_rpc).collect())
+    }
+
+    /// Sends native CKB from the wallet's funding lock to a testnet address.
+    ///
+    /// A successful return only means the testnet RPC accepted the
+    /// transaction for broadcast. Confirmation must be checked separately via
+    /// [`Self::wallet_onchain_transfer_status`].
+    pub async fn wallet_onchain_transfer(
+        &self,
+        target_address: String,
+        amount_shannons: u64,
+        max_fee_shannons: u64,
+    ) -> Result<WalletOnchainTransfer, OnchainTransferError> {
+        let (funding_lock, secret_key) = {
+            let guard = self.runtime.lock().expect("runtime poisoned");
+            let running = guard.as_ref().ok_or(OnchainTransferError::NodeNotRunning)?;
+            let secret_key = running.ckb_config.read_secret_key().map_err(|_| {
+                OnchainTransferError::Unavailable {
+                    detail: "无法解密 CKB funding key；请检查钱包密码和 key 文件".to_owned(),
+                }
+            })?;
+            let expected_lock = fnn::ckb::contracts::get_script_by_contract(
+                fnn::ckb::contracts::Contract::Secp256k1Lock,
+                &ckb_hash::blake2b_256(secret_key.public_key(secp256k1::SECP256K1).serialize())
+                    [0..20],
+            );
+            if running.funding_lock.as_bytes() != expected_lock.as_bytes() {
+                return Err(OnchainTransferError::Unavailable {
+                    detail: "缓存的 funding lock 与当前 CKB 私钥不匹配".to_owned(),
+                });
+            }
+            (running.funding_lock.clone(), secret_key)
+        };
+
+        crate::onchain::transfer_ckb(
+            &target_address,
+            amount_shannons,
+            max_fee_shannons,
+            funding_lock,
+            secret_key,
+        )
+        .await
+    }
+
+    /// Queries canonical status on the fixed testnet RPC.
+    pub async fn wallet_onchain_transfer_status(
+        &self,
+        tx_hash: String,
+    ) -> Result<WalletOnchainTxStatus, OnchainTransferError> {
+        crate::onchain::transaction_status(&tx_hash, crate::onchain::TESTNET_CKB_RPC_URL).await
     }
 
     /// Connected peers. Opening a channel requires the peer to be connected
@@ -685,6 +767,73 @@ impl NodeMachine {
         })
     }
 
+    /// Requests a cooperative or force close through FNN's `shutdown_channel`
+    /// RPC and reads the channel back immediately.
+    ///
+    /// The cooperative path always uses this wallet's default funding lock as
+    /// the shutdown output script. Callers never supply a raw CKB script. The
+    /// force path must omit `close_script` and `fee_rate`; FNN uses the channel's
+    /// original shutdown script and latest commitment transaction.
+    pub async fn wallet_close_channel(
+        &self,
+        request: ChannelCloseRequest,
+    ) -> Result<WalletChannelCloseResult, String> {
+        let channel_id = validate_channel_close_request(&request)?;
+        let channel_id_hex = hex::encode(channel_id);
+        let (network_actor, store, _fiber_config, ckb_config) = self.running_parts()?;
+
+        let (close_script, fee_rate, force) = match request.mode {
+            ChannelCloseMode::Cooperative => {
+                let default_script = ckb_config
+                    .get_default_funding_lock_script()
+                    .map_err(|err| format!("failed to derive default shutdown script: {err}"))?;
+                (
+                    Some(ckb_jsonrpc_types::Script::from(default_script)),
+                    request.fee_rate,
+                    false,
+                )
+            }
+            ChannelCloseMode::Force => (None, None, true),
+        };
+
+        ChannelRpcServerImpl::new(network_actor, store)
+            .shutdown_channel(ShutdownChannelParams {
+                channel_id: fnn::rpc::channel::Hash256(channel_id),
+                close_script,
+                fee_rate,
+                force: Some(force),
+            })
+            .await
+            .map_err(|err| err.message().to_owned())?;
+
+        // The close RPC returns when FNN has accepted the command, not when
+        // the closing transaction is confirmed. A readback failure must not
+        // turn an accepted close into an apparent RPC failure.
+        let channel = match self.wallet_list_channels().await {
+            Ok(channels) => channels
+                .into_iter()
+                .find(|channel| channel.channel_id.eq_ignore_ascii_case(&channel_id_hex)),
+            Err(error) => {
+                tracing::warn!(%error, "channel close accepted but state readback failed");
+                None
+            }
+        };
+
+        Ok(WalletChannelCloseResult {
+            channel_id: channel_id_hex,
+            mode: request.mode,
+            state: channel.as_ref().map(|channel| channel.state.clone()),
+            state_flags: channel.as_ref().and_then(|channel| channel.state_flags),
+            shutdown_transaction_hash: channel
+                .as_ref()
+                .and_then(|channel| channel.shutdown_transaction_hash.clone()),
+            latest_commitment_transaction_hash: channel
+                .as_ref()
+                .and_then(|channel| channel.latest_commitment_transaction_hash.clone()),
+            failure_detail: channel.and_then(|channel| channel.failure_detail),
+        })
+    }
+
     pub async fn wallet_new_invoice(
         &self,
         amount_shannons: u64,
@@ -743,16 +892,152 @@ impl NodeMachine {
         Ok(payment_to_wallet(payment))
     }
 
-    pub async fn wallet_send_payment(&self, invoice: String) -> Result<WalletPayment, String> {
+    /// Polls one payment until Fiber reports `Success` or `Failed`.
+    ///
+    /// `expected_status` is optional for recovery paths that no longer know
+    /// the original submission result. When supplied, it must be
+    /// `Created`/`Inflight`; callers cannot "poll" a quote or assert success.
+    pub async fn wallet_poll_payment_terminal(
+        &self,
+        payment_hash: String,
+        expected_status: Option<WalletPaymentStatus>,
+        timeout: Duration,
+    ) -> Result<WalletPayment, String> {
+        if expected_status.is_some_and(WalletPaymentStatus::is_terminal) {
+            return Err(
+                "expected_status must be Created or Inflight; terminal states are returned by polling"
+                    .to_owned(),
+            );
+        }
+        let payment_hash = payment_hash.trim().to_owned();
+        crate::payment::poll_payment_until_terminal(&payment_hash, timeout, || {
+            self.wallet_get_payment(payment_hash.clone())
+        })
+        .await
+    }
+
+    /// Validates and executes either a route/fee quote (`dry_run`) or a real
+    /// native-CKB payment. A dry run deliberately neither persists a payment
+    /// session nor returns a [`WalletPayment`].
+    pub async fn wallet_send_payment_request(
+        &self,
+        request: WalletSendPaymentRequest,
+    ) -> Result<WalletSendPaymentResult, String> {
+        let request = request.into_validated()?;
+        let quote_request = request.clone();
+        let timeout_seconds = request.effective_timeout_seconds();
+        // ``timeout_seconds`` bounds the whole send/poll operation. If FNN's
+        // own timer equals ours, the outer poll can expire first and leave the
+        // UI unable to learn whether FNN actually reached Failed.
+        let fnn_timeout = timeout_seconds.saturating_add(1);
+        let poll_timeout = Duration::from_secs(timeout_seconds);
+        let dry_run = request.dry_run;
+        let timeout = Some(fnn_timeout);
         let (network_actor, store, _fiber_config, _ckb_config) = self.running_parts()?;
-        let payment = PaymentRpcServerImpl::new(network_actor, store)
+
+        let (invoice, target_pubkey, amount, keysend, quoted_amount) =
+            match (request.invoice, request.keysend) {
+                (Some(invoice), false) => {
+                    let parsed = invoice
+                        .parse::<fnn::invoice::CkbInvoice>()
+                        .map_err(|error| format!("invalid Fiber invoice: {error}"))?;
+                    if parsed.currency != fnn::invoice::Currency::Fibt {
+                        return Err(format!(
+                            "invoice currency {} does not match the embedded testnet node",
+                            parsed.currency
+                        ));
+                    }
+                    if parsed.udt_type_script().is_some() {
+                        return Err(
+                            "UDT invoices are not supported by this native-CKB payment API"
+                                .to_owned(),
+                        );
+                    }
+                    let invoice_amount = parsed
+                        .amount()
+                        .ok_or_else(|| "invoice does not specify an amount".to_owned())?;
+                    (Some(invoice), None, None, None, Some(invoice_amount))
+                }
+                (None, true) => {
+                    let target = request
+                        .target_pubkey
+                        .ok_or_else(|| "keysend requires target_pubkey".to_owned())?;
+                    let pubkey = fiber_json_types::Pubkey::from_slice(
+                        &hex::decode(&target)
+                            .map_err(|error| format!("target_pubkey is not valid hex: {error}"))?,
+                    )
+                    .map_err(|error| format!("target_pubkey: {error}"))?;
+                    (
+                        None,
+                        Some(pubkey),
+                        request.amount,
+                        Some(true),
+                        request.amount,
+                    )
+                }
+                _ => return Err("invalid payment request mode".to_owned()),
+            };
+
+        let result = PaymentRpcServerImpl::new(network_actor, store)
             .send_payment(SendPaymentCommandParams {
-                invoice: Some(invoice),
+                target_pubkey,
+                amount,
+                invoice,
+                timeout,
+                max_fee_amount: request.max_fee_amount,
+                keysend,
+                dry_run: Some(dry_run),
                 ..empty_send_payment_params()
             })
             .await
             .map_err(|err| err.message().to_owned())?;
-        Ok(payment_to_wallet(payment))
+
+        if dry_run {
+            let requested_amount = quoted_amount
+                .ok_or_else(|| "validated payment request has no amount".to_owned())?;
+            let mut quoted_request = quote_request;
+            quoted_request.dry_run = true;
+            Ok(WalletSendPaymentResult::Quote {
+                quote: WalletPaymentQuote {
+                    quote_id: hex::encode(result.payment_hash.0),
+                    amount_shannons: requested_amount.to_string(),
+                    fee_shannons: result.fee.to_string(),
+                    request: quoted_request,
+                    created_at_ms: result.created_at,
+                },
+            })
+        } else {
+            let payment_hash = hex::encode(result.payment_hash.0);
+            let initial_status = payment_status(result.status);
+            let payment = payment_to_wallet(result);
+            let (payment, terminal_error) = if initial_status.is_terminal() {
+                (payment, None)
+            } else {
+                match self
+                    .wallet_poll_payment_terminal(payment_hash, Some(initial_status), poll_timeout)
+                    .await
+                {
+                    Ok(payment) => (payment, None),
+                    Err(error) => (payment, Some(error)),
+                }
+            };
+            Ok(WalletSendPaymentResult::Submitted {
+                payment,
+                terminal_error,
+            })
+        }
+    }
+
+    pub async fn wallet_send_payment(&self, invoice: String) -> Result<WalletPayment, String> {
+        match self
+            .wallet_send_payment_request(WalletSendPaymentRequest::for_invoice(invoice))
+            .await?
+        {
+            WalletSendPaymentResult::Submitted { payment, .. } => Ok(payment),
+            WalletSendPaymentResult::Quote { .. } => {
+                Err("legacy invoice send unexpectedly returned a quote".to_owned())
+            }
+        }
     }
 }
 
@@ -781,10 +1066,20 @@ fn empty_send_payment_params() -> SendPaymentCommandParams {
 fn payment_to_wallet(payment: fnn::rpc::payment::GetPaymentCommandResult) -> WalletPayment {
     WalletPayment {
         payment_hash: hex::encode(payment.payment_hash.0),
-        status: json_variant_name(&payment.status),
+        status: payment_status(payment.status),
         failed_error: payment.failed_error,
+        fee_shannons: payment.fee.to_string(),
         created_at_ms: payment.created_at,
         last_updated_at_ms: payment.last_updated_at,
+    }
+}
+
+fn payment_status(status: fiber_json_types::payment::PaymentStatus) -> WalletPaymentStatus {
+    match status {
+        fiber_json_types::payment::PaymentStatus::Created => WalletPaymentStatus::Created,
+        fiber_json_types::payment::PaymentStatus::Inflight => WalletPaymentStatus::Inflight,
+        fiber_json_types::payment::PaymentStatus::Success => WalletPaymentStatus::Success,
+        fiber_json_types::payment::PaymentStatus::Failed => WalletPaymentStatus::Failed,
     }
 }
 
@@ -796,16 +1091,62 @@ fn parse_payment_hash(value: &str) -> Result<[u8; 32], String> {
         .map_err(|_| format!("payment hash must be 32 bytes: {value}"))
 }
 
-fn json_variant_name<T: serde::Serialize>(value: &T) -> String {
-    match serde_json::to_value(value) {
-        Ok(serde_json::Value::String(text)) => text,
-        Ok(serde_json::Value::Object(map)) => map
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_owned()),
-        Ok(other) => other.to_string(),
-        Err(_) => "unknown".to_owned(),
+fn channel_state_name(state: &ChannelState) -> &'static str {
+    match state {
+        ChannelState::NegotiatingFunding(_) => "NegotiatingFunding",
+        ChannelState::CollaboratingFundingTx(_) => "CollaboratingFundingTx",
+        ChannelState::SigningCommitment(_) => "SigningCommitment",
+        ChannelState::AwaitingTxSignatures(_) => "AwaitingTxSignatures",
+        ChannelState::AwaitingChannelReady(_) => "AwaitingChannelReady",
+        ChannelState::ChannelReady => "ChannelReady",
+        ChannelState::ShuttingDown(_) => "ShuttingDown",
+        ChannelState::Closed(_) => "Closed",
+        ChannelState::Stale => "Stale",
+    }
+}
+
+fn channel_state_flags(state: &ChannelState) -> Option<u32> {
+    match state {
+        ChannelState::NegotiatingFunding(flags) => Some(flags.0),
+        ChannelState::CollaboratingFundingTx(flags) => Some(flags.0),
+        ChannelState::SigningCommitment(flags) => Some(flags.0),
+        ChannelState::AwaitingTxSignatures(flags) => Some(flags.0),
+        ChannelState::AwaitingChannelReady(flags) => Some(flags.0),
+        ChannelState::ChannelReady | ChannelState::Stale => None,
+        ChannelState::ShuttingDown(flags) => Some(flags.0),
+        ChannelState::Closed(flags) => Some(flags.0),
+    }
+}
+
+fn wallet_channel_from_rpc(channel: fiber_json_types::channel::Channel) -> WalletChannel {
+    let state_flags = channel_state_flags(&channel.state);
+    let funding_asset = match channel.funding_udt_type_script {
+        Some(script) => WalletChannelAsset::Udt {
+            type_script: format!(
+                "{}:{}:{}",
+                hex::encode(script.code_hash),
+                script.hash_type,
+                hex::encode(script.args.as_bytes())
+            ),
+        },
+        None => WalletChannelAsset::NativeCkb,
+    };
+    WalletChannel {
+        channel_id: hex::encode(channel.channel_id.0),
+        peer_id: channel.pubkey.to_string(),
+        state: channel_state_name(&channel.state).to_owned(),
+        state_flags,
+        is_inbound: channel.is_acceptor,
+        local_balance: channel.local_balance.to_string(),
+        remote_balance: channel.remote_balance.to_string(),
+        funding_asset,
+        latest_commitment_transaction_hash: channel
+            .latest_commitment_transaction_hash
+            .map(|hash| hex::encode(hash.0)),
+        shutdown_transaction_hash: channel
+            .shutdown_transaction_hash
+            .map(|hash| hex::encode(hash.0)),
+        failure_detail: channel.failure_detail,
     }
 }
 

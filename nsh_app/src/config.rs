@@ -118,7 +118,14 @@ pub fn save(config: &AppConfig) {
 /// CKB RPC clients (reqwest-based) pick these up when they are built, so a
 /// node restart makes the proxy effective; P2P connections are never proxied.
 pub fn apply_proxy_env(config: &AppConfig) {
-    let keys = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+    let keys = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
     if config.proxy_enabled && !config.proxy_host.trim().is_empty() && config.proxy_port > 0 {
         let url = format!("http://{}:{}", config.proxy_host.trim(), config.proxy_port);
         // Called once at startup before threads spawn, and from the settings

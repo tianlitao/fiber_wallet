@@ -2713,8 +2713,10 @@ dependencies = [
 name = "fiber_wallet_core"
 version = "0.2.0"
 dependencies = [
+ "bech32 0.9.1",
  "cc",
  "ckb-chain-spec",
+ "ckb-hash",
  "ckb-jsonrpc-types",
  "ckb-resource",
  "ckb-sdk",
@@ -5015,6 +5017,8 @@ dependencies = [
  "chrono",
  "fast_qr",
  "fiber_wallet_core",
+ "getrandom 0.3.4",
+ "hex",
  "keyring",
  "nsh-base",
  "nsh-core",
@@ -5029,6 +5033,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

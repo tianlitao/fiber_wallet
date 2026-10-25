@@ -19,9 +19,7 @@ const ACCOUNT: &str = "fiber-wallet-key-password";
 /// fall back to the bridge's file-based development path rather than blocking
 /// startup; the error is logged for diagnosis.
 pub fn install_keychain_password() {
-    if std::env::var_os("FIBER_SECRET_KEY_PASSWORD")
-        .is_some_and(|value| !value.is_empty())
-    {
+    if std::env::var_os("FIBER_SECRET_KEY_PASSWORD").is_some_and(|value| !value.is_empty()) {
         return;
     }
 
@@ -50,10 +48,8 @@ fn load_or_create() -> Result<String, String> {
             Ok(text) if !text.is_empty() => Ok(text),
             _ => create_and_store(),
         },
-                // errSecItemNotFound: no password stored yet.
-        Err(error) if error.code() == -25300 => {
-            create_and_store()
-        }
+        // errSecItemNotFound: no password stored yet.
+        Err(error) if error.code() == -25300 => create_and_store(),
         Err(error) => Err(format!("Keychain lookup failed: {error}")),
     }
 }
