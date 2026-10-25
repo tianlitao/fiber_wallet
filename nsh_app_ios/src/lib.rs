@@ -58,7 +58,13 @@ pub fn App() -> impl IntoElement {
 
     let cx = Cx {
         config: signal(shared::config::get().clone()),
-        nav: signal(Nav::Home),
+        // Dev affordance for visual checks: FIBER_WALLET_START_PAGE=trade|discover|settings.
+        nav: signal(match std::env::var("FIBER_WALLET_START_PAGE").as_deref() {
+            Ok("trade") => Nav::Trade,
+            Ok("discover") => Nav::Discover,
+            Ok("settings") => Nav::Settings,
+            _ => Nav::Home,
+        }),
         trade_tab: signal(0_usize),
         ui: signal(bridge::WalletBridge::global().state()),
         invoice_history: signal(Vec::new()),

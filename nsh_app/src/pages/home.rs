@@ -175,53 +175,71 @@ fn stat_card(
     label: &'static str,
     value: impl Fn() -> String + 'static,
 ) -> View {
-    view()
-        .flex_1()
-        .min_w(px(0.0))
+    let glyph_tile = view()
+        .size(px(26.0))
+        .items_center()
+        .justify_center()
+        .rounded(px(7.0))
+        .bg(move || pal_fn(&cx).card_alt)
+        .child(
+            text(glyph)
+                .text_size(px(ts::SM))
+                .text_color(move || pal_fn(&cx).accent),
+        );
+    let value_text = {
+        // A phone's full-width row cannot fit a long CKB balance at the
+        // desktop stat size; one step down keeps it on one line.
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        let value_size = ts::LG;
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        let value_size = ts::XL;
+        text(value)
+            .text_size(px(value_size))
+            .font_weight(FontWeight::SEMIBOLD)
+            .font_family(theme::mono_family)
+            .text_color(move || pal_fn(&cx).fg)
+    };
+    // Phones render one compact row; the desktop column reads better when
+    // three cards share a row.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    let body = view()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .child(glyph_tile)
+        .child(
+            text(label)
+                .text_size(px(ts::SM))
+                .text_color(move || pal_fn(&cx).fg_muted),
+        )
+        .child(view().flex_1())
+        .child(value_text);
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    let body = view()
         .gap_2()
-        .p_4()
-        .rounded(px(14.0))
-        .bg(move || pal_fn(&cx).card)
-        .border_1()
-        .border_color(move || pal_fn(&cx).border)
-        .shadow_xs()
         .child(
             view()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(
-                    view()
-                        .size(px(26.0))
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(7.0))
-                        .bg(move || pal_fn(&cx).card_alt)
-                        .child(
-                            text(glyph)
-                                .text_size(px(ts::SM))
-                                .text_color(move || pal_fn(&cx).accent),
-                        ),
-                )
+                .child(glyph_tile)
                 .child(
                     text(label)
                         .text_size(px(ts::XS))
                         .text_color(move || pal_fn(&cx).fg_muted),
                 ),
         )
-        .child({
-            // A phone's third-of-width card cannot fit a full CKB balance at
-            // the desktop stat size; one step down keeps it on one line.
-            #[cfg(any(target_os = "ios", target_os = "android"))]
-            let value_size = ts::LG;
-            #[cfg(not(any(target_os = "ios", target_os = "android")))]
-            let value_size = ts::XL;
-            text(value)
-                .text_size(px(value_size))
-                .font_weight(FontWeight::SEMIBOLD)
-                .font_family(theme::mono_family)
-                .text_color(move || pal_fn(&cx).fg)
-        })
+        .child(value_text);
+    view()
+        .flex_1()
+        .min_w(px(0.0))
+        .p_4()
+        .rounded(px(14.0))
+        .bg(move || pal_fn(&cx).card)
+        .border_1()
+        .border_color(move || pal_fn(&cx).border)
+        .shadow_xs()
+        .child(body)
 }
 
 fn stat_row(cx: Cx) -> View {
@@ -231,37 +249,32 @@ fn stat_row(cx: Cx) -> View {
     let row = view().gap_3();
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     let row = view().flex_row().gap_4();
-    row
-        .child(stat_card(cx, "◆", "链上余额", {
-            move || {
-                cx.ui_state()
-                    .node_info
-                    .map(|info| {
-                        format!("{} CKB", theme::ckb_display(&info.funding_balance_shannons))
-                    })
-                    .unwrap_or_else(|| "—".to_owned())
+    row.child(stat_card(cx, "◆", "链上余额", {
+        move || {
+            cx.ui_state()
+                .node_info
+                .map(|info| format!("{} CKB", theme::ckb_display(&info.funding_balance_shannons)))
+                .unwrap_or_else(|| "—".to_owned())
+        }
+    }))
+    .child(stat_card(cx, "⇌", "通道余额", {
+        move || {
+            cx.ui_state()
+                .node_info
+                .map(|info| format!("{} CKB", theme::ckb_display(&info.channel_balance_shannons)))
+                .unwrap_or_else(|| "—".to_owned())
+        }
+    }))
+    .child(stat_card(cx, "◧", "通道数", {
+        move || {
+            let state = cx.ui_state();
+            if state.snapshot.map(|s| s.phase) == Some(NodePhase::Running) {
+                format!("{}", state.channels.len())
+            } else {
+                "—".to_owned()
             }
-        }))
-        .child(stat_card(cx, "⇌", "通道余额", {
-            move || {
-                cx.ui_state()
-                    .node_info
-                    .map(|info| {
-                        format!("{} CKB", theme::ckb_display(&info.channel_balance_shannons))
-                    })
-                    .unwrap_or_else(|| "—".to_owned())
-            }
-        }))
-        .child(stat_card(cx, "◧", "通道数", {
-            move || {
-                let state = cx.ui_state();
-                if state.snapshot.map(|s| s.phase) == Some(NodePhase::Running) {
-                    format!("{}", state.channels.len())
-                } else {
-                    "—".to_owned()
-                }
-            }
-        }))
+        }
+    }))
 }
 
 fn quick_actions(cx: Cx) -> View {
