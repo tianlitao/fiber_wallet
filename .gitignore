@@ -10,3 +10,9 @@ node_modules/
 .idea/
 .vscode/
 *.log
+
+# NSH tooling build output and packaged mobile artifacts
+.nsh/
+*.apk
+*.dex
+nsh_app_android/.nsh/rust/android-rust-release/

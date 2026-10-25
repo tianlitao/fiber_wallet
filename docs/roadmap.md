@@ -33,11 +33,17 @@ Goal: prove the host/Rust app-lifecycle boundary.
   pass; device signing not executed.
 - Android NDK build and real-device test. 🔶 arm64 build + emulator
   integration test pass; no device attached.
-- Keychain/Keystore adapters. ❌ dev password fallback still in place.
+- Keychain/Keystore adapters. ✅ iOS Keychain (`nsh_app_ios/src/keychain.rs`)
+  and Android Keystore (`nsh_app_android/src/keystore.rs`, verified on the
+  emulator: vault=Env on a fresh install) both export the password through
+  `FIBER_SECRET_KEY_PASSWORD`; desktop keeps the keyring path.
 - Background stop and foreground restart. ✅ (bridge lifecycle handling,
   exercised by unit tests).
 - Database lock and unclean-shutdown recovery. ✅ flock + recovery smoke.
-- QR scan through a native plugin or platform channel. ❌
+- QR scan through a native plugin or platform channel. ✅ shared `scan` hook
+  (`nsh_app/src/scan.rs`) with an AVFoundation scanner on iOS and a Camera2
+  NDK scanner on Android (dex bridge + rqrr decode); emulator-verified UI,
+  permission, preview and cancel flows — real-QR decode on hardware pending.
 
 ## M2.5 — in-app dApp provider — **done**
 

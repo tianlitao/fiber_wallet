@@ -23,9 +23,10 @@ core/            Rust wallet core (framework-agnostic crate)
   src/bin/       Recovery smoke binary
 vendor/fiber/    Pinned nervosnetwork/fiber v0.9.1 (see FIBER_WALLET_PATCH.md)
 nsh_app/         The NSH macOS shell (UI host); depends on ../core
-nsh_app_ios/     The NSH iOS shell: bottom-tab UI over the same bridge, Keychain-backed wallet password
+nsh_app_ios/     The NSH iOS shell: bottom-tab UI over the same bridge, Keychain-backed wallet password, AVFoundation QR scanner
+nsh_app_android/ The NSH Android shell: bottom-tab UI over the same bridge, Keystore-backed wallet password, Camera2 QR scanner
 docs/            Architecture, fiber integration, toolchain, status
-scripts/         Recovery smoke driver, Android toolchain bootstrap
+scripts/         Recovery smoke driver, Android toolchain bootstrap and build/permission helpers
 ```
 
 ## The core crate
@@ -78,7 +79,27 @@ approval dialog. dApps never see key material or arbitrary RPC. See
 `nsh_app/src/dapp_host.rs`, `dapp_protocol.rs`, and `dapp_registry.rs`.
 
 Hosts provide the secret password from platform secure storage; this crate
-never stores secrets itself.
+never stores secrets itself. iOS reads the Keychain (`nsh_app_ios/src/keychain.rs`)
+and Android the hardware-backed Keystore (`nsh_app_android/src/keystore.rs`);
+both export it through `FIBER_SECRET_KEY_PASSWORD` before the bridge
+initializes. 交易页's 扫一扫 opens the platform camera scanner through the
+shared `scan` hook (`nsh_app/src/scan.rs`): AVFoundation on iOS, Camera2 NDK
+plus a runtime-loaded dex bridge on Android (`nsh_app_android/src/scanner.rs`).
+
+## Android shell
+
+Run the Android shell on the emulator (boots it, builds both ABIs, installs
+and launches):
+
+```sh
+scripts/build-android.sh nsh_app_android run --target android
+```
+
+The nsh CLI generates the app manifest from a template that only declares
+INTERNET, so the scanner's CAMERA permission is added to the packaged APK by
+`scripts/patch_apk_camera.sh` (re-links the manifest, re-signs with the
+Android debug key); reinstall the patched APK and `pm grant` the permission
+before exercising 扫一扫. See the script headers for the details.
 
 `src/api/` re-exports the same items under the module paths the NSH shell was
 originally wired against (`api::node::init_local_node`, `api::wallet::*`); it

@@ -175,13 +175,23 @@ pub fn quick_action(
     hint: &'static str,
     on_press: impl Fn() + 'static,
 ) -> View {
+    let press = press_feedback();
+    let press_bg = press.is_pressed;
+    let press_trigger = press.trigger;
     view()
         .flex_row()
         .items_center()
         .gap_3()
         .p_4()
         .rounded(px(14.0))
-        .bg(move || pal_fn(&cx).card)
+        .bg(move || {
+            let colors = pal_fn(&cx);
+            if press_bg() {
+                colors.card_alt
+            } else {
+                colors.card
+            }
+        })
         .border_1()
         .border_color(move || pal_fn(&cx).border)
         .shadow_xs()
@@ -195,8 +205,11 @@ pub fn quick_action(
                 .border_color(pal_fn(&cx).accent.opacity(0.45))
                 .shadow_md()
         })
-        .active(|style| style.opacity(0.85))
-        .on_press(on_press)
+        .active(|style| style.opacity(0.8))
+        .on_press(move || {
+            press_trigger();
+            on_press();
+        })
         .child(
             view()
                 .size(px(38.0))
@@ -306,6 +319,29 @@ pub fn right_status(cx: Cx) -> View {
     }))
 }
 
+/// A pressed flag that flips back after a beat: tapping a button dims it
+/// immediately (touch has no hover, and the operation's own busy state may
+/// take a frame or a network round trip to arrive).
+struct Press {
+    is_pressed: Box<dyn Fn() -> bool + 'static>,
+    trigger: Box<dyn Fn() + 'static>,
+}
+
+fn press_feedback() -> Press {
+    let pressed = signal(false);
+    Press {
+        is_pressed: Box::new(move || pressed.get()),
+        trigger: Box::new(move || {
+            pressed.set(true);
+            let pressed = pressed;
+            spawn(async move {
+                timer(std::time::Duration::from_millis(450)).await;
+                pressed.set(false);
+            });
+        }),
+    }
+}
+
 pub fn primary_button(
     cx: Cx,
     label: &'static str,
@@ -314,6 +350,10 @@ pub fn primary_button(
 ) -> View {
     let enabled_bg = enabled.clone();
     let enabled_fg = enabled.clone();
+    let press = press_feedback();
+    let press_bg = press.is_pressed;
+    let enabled_on_press = enabled.clone();
+    let press_trigger = press.trigger;
     view()
         .flex_row()
         .items_center()
@@ -324,7 +364,9 @@ pub fn primary_button(
         .rounded(px(10.0))
         .bg(move || {
             let colors = pal_fn(&cx);
-            if enabled_bg() {
+            if press_bg() {
+                colors.accent.opacity(0.55)
+            } else if enabled_bg() {
                 colors.accent
             } else {
                 colors.card_alt
@@ -334,9 +376,10 @@ pub fn primary_button(
         .transition_all()
         .duration(140.0)
         .hover(|style| style.opacity(0.9))
-        .active(|style| style.opacity(0.78))
+        .active(|style| style.opacity(0.7))
         .on_press(move || {
-            if enabled() {
+            if enabled_on_press() {
+                press_trigger();
                 on_press();
             }
         })
@@ -362,6 +405,10 @@ pub fn outline_button(
     on_press: impl Fn() + 'static,
 ) -> View {
     let enabled_fg = enabled.clone();
+    let press = press_feedback();
+    let press_bg = press.is_pressed;
+    let enabled_on_press = enabled.clone();
+    let press_trigger = press.trigger;
     view()
         .flex_row()
         .items_center()
@@ -376,9 +423,18 @@ pub fn outline_button(
         .transition_all()
         .duration(140.0)
         .hover(move |style| style.bg(pal_fn(&cx).card_alt))
-        .active(|style| style.opacity(0.75))
+        .active(|style| style.opacity(0.7))
+        .bg(move || {
+            let colors = pal_fn(&cx);
+            if press_bg() {
+                colors.card_alt
+            } else {
+                transparent_black()
+            }
+        })
         .on_press(move || {
-            if enabled() {
+            if enabled_on_press() {
+                press_trigger();
                 on_press();
             }
         })

@@ -209,20 +209,30 @@ fn stat_card(
                         .text_color(move || pal_fn(&cx).fg_muted),
                 ),
         )
-        .child(
+        .child({
+            // A phone's third-of-width card cannot fit a full CKB balance at
+            // the desktop stat size; one step down keeps it on one line.
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            let value_size = ts::LG;
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            let value_size = ts::XL;
             text(value)
-                .text_size(px(ts::XL))
+                .text_size(px(value_size))
                 .font_weight(FontWeight::SEMIBOLD)
                 .font_family(theme::mono_family)
-                .text_color(move || pal_fn(&cx).fg),
-        )
+                .text_color(move || pal_fn(&cx).fg)
+        })
 }
 
 fn stat_row(cx: Cx) -> View {
-    view()
-        .flex_row()
-        .gap_4()
-        .child(stat_card(cx, "⛓", "链上余额", {
+    // Phones stack the three stats full-width: a third-of-width card
+    // wraps even a capped CKB balance at the readable size.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    let row = view().gap_3();
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    let row = view().flex_row().gap_4();
+    row
+        .child(stat_card(cx, "◆", "链上余额", {
             move || {
                 cx.ui_state()
                     .node_info
@@ -258,39 +268,41 @@ fn quick_actions(cx: Cx) -> View {
     let cx_home = cx;
     let cx_pay = cx;
     let cx_transfer = cx;
-    view()
-        .flex_row()
-        .gap_4()
-        .child(quick_action(
-            cx,
-            "↓",
-            "收款",
-            "创建发票 · 二维码",
-            move || {
-                cx_home.nav.set(Nav::Trade);
-                cx_home.trade_tab.set(2);
-            },
-        ))
-        .child(quick_action(
-            cx,
-            "↑",
-            "付款",
-            "发票 · keysend 直付",
-            move || {
-                cx_pay.nav.set(Nav::Trade);
-                cx_pay.trade_tab.set(3);
-            },
-        ))
-        .child(quick_action(
-            cx,
-            "⇄",
-            "链上转账",
-            "CKB Testnet 原生转账",
-            move || {
-                cx_transfer.nav.set(Nav::Trade);
-                cx_transfer.trade_tab.set(1);
-            },
-        ))
+    // A phone stacks the cards: three columns cannot fit a hint line.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    let row = view().gap_3();
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    let row = view().flex_row().gap_4();
+    row.child(quick_action(
+        cx,
+        "↓",
+        "收款",
+        "创建发票 · 二维码",
+        move || {
+            cx_home.nav.set(Nav::Trade);
+            cx_home.trade_tab.set(2);
+        },
+    ))
+    .child(quick_action(
+        cx,
+        "↑",
+        "付款",
+        "发票 · keysend 直付",
+        move || {
+            cx_pay.nav.set(Nav::Trade);
+            cx_pay.trade_tab.set(3);
+        },
+    ))
+    .child(quick_action(
+        cx,
+        "⇄",
+        "链上转账",
+        "CKB Testnet 原生转账",
+        move || {
+            cx_transfer.nav.set(Nav::Trade);
+            cx_transfer.trade_tab.set(1);
+        },
+    ))
 }
 
 fn activity_row(cx: Cx) -> View {

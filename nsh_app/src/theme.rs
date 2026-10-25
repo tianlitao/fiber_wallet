@@ -167,10 +167,14 @@ pub fn mono_family() -> SharedString {
 }
 
 /// Formats a shannons balance for display: thousands-separated CKB.
+/// CKB for display, thousands-grouped. The fraction is capped at 4 digits
+/// (truncated, never rounded up — the shown amount must not exceed the real
+/// one); full precision stays available in the payment/hash details.
 pub fn ckb_display(shannons: &str) -> String {
     let value: u128 = shannons.parse().unwrap_or(0);
     let whole = value / 100_000_000;
     let fraction = format!("{:08}", value % 100_000_000);
+    let fraction = &fraction[..4];
     let fraction = fraction.trim_end_matches('0');
     let grouped = group_thousands(&whole.to_string());
     if fraction.is_empty() {
@@ -200,4 +204,22 @@ pub fn short_id(id: &str, keep: usize) -> String {
     let head: String = id.chars().take(keep).collect();
     let tail: String = id.chars().skip(id.chars().count() - keep).collect();
     format!("{head}…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ckb_display_caps_fraction_at_four_digits() {
+        assert_eq!(ckb_display("0"), "0");
+        assert_eq!(ckb_display("100000000"), "1");
+        // 1.5 CKB
+        assert_eq!(ckb_display("150000000"), "1.5");
+        // Truncates, never rounds up: 9,699.99999999536 CKB shows 9,699.9999.
+        assert_eq!(ckb_display("969999990536"), "9,699.9999");
+        // 0.00009 CKB truncates to 0 — the fraction vanishes.
+        assert_eq!(ckb_display("9000"), "0");
+        assert_eq!(ckb_display("123456789012345678"), "1,234,567,890.1234");
+    }
 }

@@ -51,7 +51,24 @@ tests + clippy `-D warnings`) and `make recovery-smoke`:
   - 设置: theme (mode + 5 accents), HTTP(S) proxy, keystore password change
     (`vault.rs`), backup export/import.
 - `nsh_app_ios/` shares the bridge/pages and compiles for the iOS simulator;
-  the wallet password comes from the iOS Keychain.
+  the wallet password comes from the iOS Keychain, and 交易页's 扫一扫 opens
+  an AVFoundation QR sheet registered into the shared `scan` hook.
+- `nsh_app_android/` (Android shell) runs end to end on the emulator
+  (`scripts/build-android.sh nsh_app_android run --target android`):
+  bottom-tab UI over the shared pages, the wallet password created in the
+  hardware-backed Android Keystore and exported through
+  `FIBER_SECRET_KEY_PASSWORD` (vault=Env, verified in the logs), and the
+  embedded FNN node reaching `online` against CKB testnet. 交易页's 扫一扫
+  opens a full-screen Camera2 scanner: the Java glue ships as a tiny
+  precompiled dex (`bridge/scanner_bridge.dex`, built by
+  `scripts/build_scanner_dex.sh`) loaded through an `InMemoryDexClassLoader`,
+  the activity is tracked through lifecycle callbacks with an
+  `ActivityThread` reflection fallback, the preview SurfaceView overlays the
+  app, and frames decode through rqrr (`src/qr.rs`). Verified on the
+  emulator: scan button, overlay with live camera preview, 取消 dismissal,
+  app stability across the whole flow. The nsh-generated manifest only
+  declares INTERNET, so the CAMERA permission is added to the packaged APK
+  by `scripts/patch_apk_camera.sh` and granted with `pm grant`.
 - The core was exercised end to end on macOS, the iOS simulator, and the
   Android emulator with the real FNN (macOS integration test:
   start/stop/restart with a real node id and `fnn v0.9.1 (sqlite)`; Android
@@ -83,6 +100,12 @@ tests + clippy `-D warnings`) and `make recovery-smoke`:
 - Funded testnet end-to-end runs from this workspace (faucet CKB): opening a
   funded channel, a real keysend over it, and a real funded close. All the
   code paths and UI exist; they need a funded testnet address to exercise.
+- QR decode against a real camera image on Android: the emulator's virtual
+  scene offers no QR code to point at, so the decode path is covered by
+  `src/qr.rs` unit tests (padded-stride synthetic frames, invoice-sized
+  payloads) while the camera, overlay, and permission flows are verified
+  live. Real-hardware decode is still to be exercised.
+- Android real-device run (emulator only so far); iOS real-device signing.
 - M3 Web edge node: deferred by product decision (the in-app dApp provider
   above is the shipped web-story for now).
 - QR scan via camera (desktop QR display works).

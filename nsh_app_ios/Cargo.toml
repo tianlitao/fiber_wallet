@@ -18,3 +18,34 @@ security-framework = "3"
 # The macOS shell owns the bridge, theme, widgets, and pages; the iOS shell
 # reuses them and swaps the desktop sidebar for a bottom tab bar.
 nsh-app-fiber-wallet-nsh = { path = "../nsh_app" }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-foundation = "0.3"
+objc2-ui-kit = { version = "0.3", features = [
+    "UIButton",
+    "UIControl",
+    "UIColor",
+    "UIFont",
+    "UILabel",
+    "UIApplication",
+    "UIResponder",
+    "UIView",
+    "UIWindowScene",
+    "UIViewController",
+] }
+objc2-av-foundation = { version = "0.3", features = [
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureMetadataOutput",
+    "AVCaptureOutput",
+    "AVCaptureSession",
+    "AVCaptureVideoPreviewLayer",
+    "AVFCapture",
+    "AVMediaFormat",
+    "AVMetadataObject",
+] }
+objc2-quartz-core = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"

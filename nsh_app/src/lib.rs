@@ -12,14 +12,15 @@ pub mod dapp_protocol;
 pub mod dapp_registry;
 pub mod logs;
 pub mod pages;
+pub mod scan;
 pub mod theme;
 pub mod vault;
 pub mod widgets;
 
 use nsh_base::safe_area_view;
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use nsh_core::desktop::TitleBarStyle;
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use nsh_core::ui::desktop::{set_title_bar, title_bar};
 use nsh_core::ui::prelude::*;
 
@@ -146,7 +147,7 @@ pub fn App() -> impl IntoElement {
 
 /// The app's own title bar (desktop only): the system one is hidden, this one
 /// drags the window and leaves the traffic lights their space on the left.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn app_title_bar(cx: Cx) -> View {
     // The headless test engine has no window: skip the desktop commands and
     // the title-bar insets read entirely.
@@ -180,7 +181,7 @@ fn app_title_bar(cx: Cx) -> View {
 }
 
 /// iOS renders no window chrome: the shell provides its own header.
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 fn app_title_bar(_cx: Cx) -> View {
     view()
 }

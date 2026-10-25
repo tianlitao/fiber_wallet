@@ -1,0 +1,31 @@
+[package]
+name = "nsh-app-fiber-wallet-android"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "NSH (Native Shell) Android shell for the Fiber wallet: bottom-tab UI over the shared wallet bridge, Keystore-backed secret password, camera QR scanner"
+
+[workspace]
+
+[dependencies]
+fiber_wallet_core = { path = "../core" }
+nsh-core = "0.2.0"
+nsh-base = "0.2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+
+# The macOS shell owns the bridge, theme, widgets, and pages; this shell
+# reuses them and swaps the desktop sidebar for a bottom tab bar.
+nsh-app-fiber-wallet-nsh = { path = "../nsh_app" }
+
+# Pure-Rust QR decode over the camera's luma frames (no image crate needed).
+# Host-testable: `qr.rs` compiles everywhere so the decoder runs in `cargo test`.
+rqrr = "0.11"
+
+[dev-dependencies]
+fast_qr = "0.12"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+libc = "0.2"
+getrandom = "0.3"

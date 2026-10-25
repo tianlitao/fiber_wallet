@@ -320,17 +320,19 @@ fn backup_card(cx: Cx) -> View {
                     .text_size(px(ts::XS))
                     .text_color(move || pal_fn(&cx).fg_muted),
             )
-            .child(
-                view()
-                    .flex_row()
-                    .items_start()
-                    .gap_3()
-                    .child(
-                        labeled_input(cx, "导出到", export_path, "~/Downloads/…", false).flex_1(),
-                    )
-                    .child(labeled_input(cx, "导出密码 (≥8位)", export_password, "••••••••", false).w(px(170.0)))
-                    .child(labeled_input(cx, "确认密码", export_confirm, "••••••••", false).w(px(170.0))),
-            )
+            .child({
+                // Desktop: path and the two password fields share one row. A
+                // phone stacks them — the two 170 pt password fields would
+                // leave the path input a sliver.
+                #[cfg(any(target_os = "ios", target_os = "android"))]
+                let fields = view().gap_3();
+                #[cfg(not(any(target_os = "ios", target_os = "android")))]
+                let fields = view().flex_row().items_start().gap_3();
+                fields
+                    .child(labeled_input(cx, "导出到", export_path, "~/Downloads/…", false))
+                    .child(labeled_input(cx, "导出密码 (≥8位)", export_password, "••••••••", false))
+                    .child(labeled_input(cx, "确认密码", export_confirm, "••••••••", false))
+            })
             .child(
                 view()
                     .flex_row()

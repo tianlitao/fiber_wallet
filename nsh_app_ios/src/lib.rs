@@ -3,7 +3,10 @@
 //! shared pages (首页 / 交易 / 发现 / 设置) in a scroll area, and a bottom
 //! tab bar instead of the desktop icon sidebar.
 
+#[cfg(target_os = "ios")]
 pub mod keychain;
+#[cfg(target_os = "ios")]
+pub mod scanner;
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -30,6 +33,9 @@ pub fn App() -> impl IntoElement {
     // Keychain and the bridge so their startup lines are captured too.
     install_tracing();
     tracing::warn!("ios shell: App() entered");
+    // The camera scanner backs 交易页's 扫一扫 buttons (shared `scan` hook).
+    #[cfg(target_os = "ios")]
+    scanner::install();
     // Loads config.json (theme, accent, proxy) and applies the proxy env
     // before any RPC client is built, as the macOS binary does in `main`.
     // This must be `load`, not `get`: `get` is `get_or_init(load)`, and
@@ -44,13 +50,15 @@ pub fn App() -> impl IntoElement {
     );
     // Before the bridge initializes: the password comes from the Keychain and
     // is exported through FIBER_SECRET_KEY_PASSWORD, which the bridge reads
-    // before its file fallback.
+    // before its file fallback. (The nsh tooling also builds this crate on
+    // the host to describe components; the module is iOS-only.)
+    #[cfg(target_os = "ios")]
     keychain::install_keychain_password();
     tracing::warn!("ios shell: keychain done");
 
     let cx = Cx {
         config: signal(shared::config::get().clone()),
-        nav: signal(Nav::Trade), // TEMP-VERIFY: trade page on iOS
+        nav: signal(Nav::Home),
         trade_tab: signal(0_usize),
         ui: signal(bridge::WalletBridge::global().state()),
         invoice_history: signal(Vec::new()),
@@ -115,35 +123,36 @@ pub fn App() -> impl IntoElement {
         .flex_1()
         .bg(move || theme::palette(&cx.config.get()).bg)
         .text_color(move || theme::palette(&cx.config.get()).fg)
-        .child(status_header(cx))
         .child(
+            // One safe-area shell: the header clears the status bar (time /
+            // notch) at the top, the tab bar clears the home indicator at the
+            // bottom, and the scroll content sits between them.
             safe_area_view()
                 .flex_1()
+                .child(status_header(cx))
                 .child(
-                    scroll()
-                        .flex_1()
-                        .child(
-                            view()
-                                .w_full()
-                                .p_4()
-                                .child(dynamic(move || match cx.nav.get() {
-                                    Nav::Home => {
-                                        Some(view().child(shared::pages::home::home_page(cx)))
-                                    }
-                                    Nav::Trade => {
-                                        Some(view().child(shared::pages::trade::trade_page(cx)))
-                                    }
-                                    Nav::Discover => Some(
-                                        view().child(shared::pages::discover::discover_page(cx)),
-                                    ),
-                                    Nav::Settings => Some(
-                                        view().child(shared::pages::settings::settings_page(cx)),
-                                    ),
-                                })),
-                        ),
-                ),
+                    scroll().flex_1().child(
+                        view()
+                            .w_full()
+                            .p_4()
+                            .child(dynamic(move || match cx.nav.get() {
+                                Nav::Home => {
+                                    Some(view().child(shared::pages::home::home_page(cx)))
+                                }
+                                Nav::Trade => {
+                                    Some(view().child(shared::pages::trade::trade_page(cx)))
+                                }
+                                Nav::Discover => Some(
+                                    view().child(shared::pages::discover::discover_page(cx)),
+                                ),
+                                Nav::Settings => Some(
+                                    view().child(shared::pages::settings::settings_page(cx)),
+                                ),
+                            })),
+                    ),
+                )
+                .child(tab_bar(cx)),
         )
-        .child(tab_bar(cx))
 }
 
 /// A slim header: wallet title on the left, the live node phase on the right
@@ -179,14 +188,17 @@ fn status_header(cx: Cx) -> View {
                 ),
         )
         .child(dynamic(move || {
-            let ui = bridge::WalletBridge::global().state();
+            // The reactive mirror, not a raw `bridge.state()` read: a plain
+            // snapshot never re-renders, so the phase pill would freeze.
+            let ui = cx.ui_state();
             let Some(snapshot) = ui.snapshot else {
                 return view().child(text("…").text_size(px(theme::type_scale::SM)));
             };
 
             let (label, color_key): (&str, fn(&theme::Palette) -> Hsla) = match snapshot.phase {
-                NodePhase::Running => ("节点在线", |p| p.accent),
-                NodePhase::Starting | NodePhase::Stopping => ("切换中", |p| p.fg_muted),
+                NodePhase::Running => ("节点在线", |p| p.ok),
+                NodePhase::Starting => ("启动中", |p| p.warn),
+                NodePhase::Stopping => ("停止中", |p| p.warn),
                 NodePhase::Stopped => ("离线", |p| p.fg_muted),
                 NodePhase::Failed => ("失败", |p| p.danger),
             };
@@ -283,6 +295,7 @@ fn tab_item(cx: Cx, item: Nav) -> View {
         .py_1()
         .rounded(px(10.0))
         .cursor_pointer()
+        .active(|style| style.opacity(0.45))
         .on_press(move || cx.nav.set(item))
         .child(
             text(item.glyph())

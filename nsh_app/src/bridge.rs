@@ -567,8 +567,47 @@ impl WalletBridge {
                 let message = panic_message(&panic);
                 tracing::error!(op, message = %message, "wallet operation panicked");
                 self.fail(format!("内部错误（{op}）：{message}"));
+                // The panicked closure never reached its own completion update:
+                // without this every busy flag it set stays stuck and the
+                // matching buttons stay disabled forever.
+                self.reset_transient_state(op, &message);
+                self.flash(
+                    FlashKind::Error,
+                    format!("操作 {op} 因内部错误中断：{message}"),
+                );
             }
         });
+    }
+
+    /// Returns every in-flight busy flag / transient phase to a safe state
+    /// after an operation thread died mid-flight.
+    fn reset_transient_state(&self, op: &str, message: &str) {
+        let error = format!("操作 {op} 因内部错误中断：{message}");
+        self.update(|state| {
+            state.busy = false;
+            state.invoice_busy = false;
+            state.send_busy = false;
+            state.open_channel_busy = false;
+            state.closing_channel_id = None;
+            state.data_busy = false;
+            state.backup_busy = false;
+            state.password_busy = false;
+            if matches!(
+                state.transfer.phase,
+                PaymentPhase::Quoting | PaymentPhase::Submitting
+            ) {
+                state.transfer = PaymentState {
+                    phase: PaymentPhase::Failed,
+                    error: Some(error.clone()),
+                    ..PaymentState::default()
+                };
+            }
+            if state.onchain.phase == OnchainPhase::Broadcasting {
+                state.onchain.phase = OnchainPhase::Failed;
+                state.onchain.error = Some(error.clone());
+            }
+        });
+        self.lifecycle_busy.store(false, Ordering::SeqCst);
     }
 
     pub fn create_invoice(&'static self, amount_ckb: String, description: String) {
@@ -1887,10 +1926,23 @@ impl WalletBridge {
 }
 
 /// This shell's wallet data directory, distinct from other hosts' so
-/// `wallet.lock` never contends.
+/// `wallet.lock` never contends. Mobile shells override it before the bridge
+/// initializes: Android has no `$HOME` sandbox layout, so the shell points
+/// this at its app-files directory through [`set_wallet_data_directory`].
 fn wallet_data_directory() -> PathBuf {
+    if let Some(dir) = DATA_DIRECTORY_OVERRIDE.get() {
+        return dir.clone();
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     PathBuf::from(home).join("Library/Application Support/FiberWalletNSH/fiber-wallet")
+}
+
+static DATA_DIRECTORY_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Points the wallet data directory at `dir` for this process. Must run
+/// before the first `WalletBridge::global()`; later calls are ignored.
+pub fn set_wallet_data_directory(dir: PathBuf) {
+    let _ = DATA_DIRECTORY_OVERRIDE.set(dir);
 }
 
 /// The data directory for display in settings.

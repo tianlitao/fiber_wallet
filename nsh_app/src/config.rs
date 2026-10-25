@@ -98,7 +98,19 @@ pub struct AppConfig {
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
+static PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Points the config file at `path` for this process. Mobile shells have no
+/// `$HOME` sandbox layout, so they set this before the first [`load`];
+/// later calls are ignored.
+pub fn set_config_path(path: PathBuf) {
+    let _ = PATH_OVERRIDE.set(path);
+}
+
 fn config_path() -> PathBuf {
+    if let Some(path) = PATH_OVERRIDE.get() {
+        return path.clone();
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     PathBuf::from(home).join("Library/Application Support/FiberWalletNSH/config.json")
 }
